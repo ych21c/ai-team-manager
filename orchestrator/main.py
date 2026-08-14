@@ -51,6 +51,11 @@ project_jira:   dict[str, dict]    = {}   # project_id → { epic, stories, conf
 project_docs:   dict[str, dict]    = {}   # project_id → { overview, architecture, history:[...], confluence_page_id }
 project_messages: dict[str, list[dict]] = {}   # project_id → 채팅 메시지 이력 (새로고침 시 복원용)
 MAX_STORED_MESSAGES = 300   # 프로젝트당 메모리 상한
+# project_id → {"input_tokens": int, "output_tokens": int, "cost_usd": float} — 프로젝트
+# 전체 누적. outputs["input_tokens"/"output_tokens"/"cost_usd"]는 "이번 실행 1회분"이라
+# Run으로 재실행하면 merge 시 덮어써진다(pipeline.py mark_completed) — 게이트 노드
+# 배지는 "이번 실행", 탭 헤더 합계는 이 누적치를 쓴다.
+project_token_totals: dict[str, dict] = {}
 qa_retry_counts: dict[str, int] = {}   # project_id → QA/AutoTest가 Implement에 재작업 요청한 횟수 (합산)
 MAX_QA_RETRIES = 3   # 이 횟수를 넘으면 재시도 없이 실패 처리하고 파이프라인을 멈춤 (무한루프 방지)
 chat_triage_in_flight: dict[str, float] = {}   # project_id → PM triage 태스크를 보낸 시각
@@ -119,8 +124,7 @@ def _save_project(pid: str):
         return
     os.makedirs(STATE_DIR, exist_ok=True)
     data = {
-        **_make_project_info(pid),
-        "instruction": projects[pid].instruction,
+        **_make_project_info(pid),  # instruction도 이제 여기 포함됨
         "jira": project_jira.get(pid, {}),
         "doc":  project_docs.get(pid, {}),
     }
@@ -169,6 +173,8 @@ def _load_all_projects():
             project_jira[pid] = data["jira"]
         if data.get("doc"):
             project_docs[pid] = data["doc"]
+        if data.get("token_totals"):
+            project_token_totals[pid] = data["token_totals"]
         print(f"[state] 복원됨: {pid} ({project_names[pid]})")
 
 
@@ -217,6 +223,21 @@ async def event_loop():
             await asyncio.sleep(1)
 
 
+def _accumulate_token_usage(project_id: str, outputs: dict):
+    """이번 실행분 토큰/비용을 프로젝트 누적치에 더한다. outputs에 토큰 필드가
+    없는 스테이지(autotest — LLM 호출 없음, PR 생성 실패 등 조기 종료 경로)는
+    조용히 건너뛴다. Run으로 같은 스테이지를 여러 번 재실행해도(outputs는 매번
+    덮어써짐) 누적치는 사라지지 않도록 여기서만 더한다."""
+    in_tok  = outputs.get("input_tokens")
+    out_tok = outputs.get("output_tokens")
+    if not in_tok and not out_tok:
+        return
+    totals = project_token_totals.setdefault(project_id, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0})
+    totals["input_tokens"]  += in_tok or 0
+    totals["output_tokens"] += out_tok or 0
+    totals["cost_usd"]      += outputs.get("cost_usd") or 0.0
+
+
 async def handle_agent_event(event: dict):
     project_id = event.get("project_id")
     agent_name = event.get("agent")
@@ -242,6 +263,8 @@ async def handle_agent_event(event: dict):
         if stage_name == "chat_triage":
             await _handle_chat_triage_result(pipeline, project_id, outputs)
             return
+
+        _accumulate_token_usage(project_id, outputs)
 
         # QA든 AutoTest(CI)든, 실패했는데 구체적인 피드백(needs_rework)이 있으면
         # 사람이 볼 것도 없이 Implement에 바로 재작업을 요청한다 — 예전엔 AutoTest는
@@ -745,6 +768,11 @@ async def _retry_design_with_feedback(pipeline: Pipeline, feedback: str, scenari
 
     design_stage = pipeline.stages["design"]
     design_stage.status = StageStatus.PENDING
+    # design 자체가 승인 게이트(PM→Design)를 갖게 된 뒤에도, 이 재시도는 "design을
+    # 직접 다시 돌려달라"는 명시적 사람 개입이지 PM 단계로 되돌아가는 게 아니다.
+    # approved를 건드리지 않으면 advance_pipeline이 PM→Design 게이트를 다시 띄워
+    # 정작 design 재작업 자체는 큐에 안 들어가는 버그가 생긴다.
+    design_stage.approved = True
     if scoped:
         design_stage.scenario_scope = [{"key": scenario_key, "title": story_titles[scenario_key]}]
     else:
@@ -777,7 +805,12 @@ async def _retry_planning_with_feedback(
     for name in ("planning", "design", "implement", "qa", "autotest", "release"):
         pipeline.stages[name].status = StageStatus.PENDING
         pipeline.stages[name].outputs = {}
+    # design/autotest도 이제 승인 게이트를 가지므로(design/implement/autotest/release
+    # 전부) 재기획 시 전부 다시 승인받게 한다 — 안 그러면 옛 요구사항 기준으로 이미
+    # 승인된 상태가 새 요구사항에 그대로 남아 게이트를 건너뛰게 된다.
+    pipeline.stages["design"].approved = False
     pipeline.stages["implement"].approved = False
+    pipeline.stages["autotest"].approved = False
     pipeline.stages["release"].approved = False
 
     if full_rewrite:
@@ -864,6 +897,103 @@ async def _retry_implement_with_feedback(pipeline: Pipeline, feedback: str, scen
     })
 
 
+def _completed_context(pipeline: Pipeline) -> dict:
+    """완료된 모든 스테이지의 outputs를 스테이지명으로 묶어 다음 태스크 context로
+    쓴다 — advance_pipeline(main.py:899-906 부근)이 쓰는 것과 같은 구성."""
+    ctx = {
+        name: s.outputs
+        for name, s in pipeline.stages.items()
+        if s.status == StageStatus.COMPLETED
+    }
+    if project_repos.get(pipeline.project_id):
+        ctx["github_repo"] = project_repos[pipeline.project_id]
+    return ctx
+
+
+async def _retry_qa_with_feedback(pipeline: Pipeline, feedback: str):
+    """플로우차트 탭의 Implement→QA는 게이트가 없어 자동으로 넘어가지만, QA 자체를
+    (같은 구현물로) 다시 돌리고 싶을 때 쓰는 수동 개입용 함수. QA가 바뀌면 그 결과에
+    의존하는 autotest도 다시 돌아야 하므로 함께 초기화한다. pipeline.instruction은
+    안 건드리고(다른 재실행에 영향 없게) 이번 태스크에만 피드백을 덧붙인다."""
+    pid = pipeline.project_id
+    pipeline.stages["qa"].status = StageStatus.PENDING
+    pipeline.stages["qa"].outputs = {}
+    pipeline.stages["autotest"].status = StageStatus.PENDING
+    pipeline.stages["autotest"].outputs = {}
+    pipeline.stages["autotest"].approved = False
+
+    context = _completed_context(pipeline)
+    instruction = pipeline.instruction
+    if feedback:
+        instruction += f"\n\n[QA 재실행 요청] {feedback}"
+
+    pipeline.mark_running("qa")
+    await broadcast({"type": "stage_update", "project_id": pid, "stage": "qa", "status": "running"})
+    await redis.send_task("qa", None, {
+        "project_id": pid, "stage": "qa", "instruction": instruction,
+        "context": context, "github_repo": project_repos.get(pid, ""),
+    })
+
+
+async def _retry_autotest_with_feedback(pipeline: Pipeline, feedback: str):
+    """QA→AutoTest 게이트에서 "No"를 눌러 오토테스트(CI)만 다시 돌릴 때 쓰는 함수.
+    autotest는 브랜치/커밋을 그대로 두고 CI만 재확인하는 성격이라 free-text
+    피드백은 참고용으로만 instruction에 덧붙인다."""
+    pid = pipeline.project_id
+    pipeline.stages["autotest"].status = StageStatus.PENDING
+    pipeline.stages["autotest"].outputs = {}
+
+    context = _completed_context(pipeline)
+    instruction = pipeline.instruction
+    if feedback:
+        instruction += f"\n\n[AutoTest 재실행 요청] {feedback}"
+
+    pipeline.mark_running("autotest")
+    await broadcast({"type": "stage_update", "project_id": pid, "stage": "autotest", "status": "running"})
+    await redis.send_task("autotest", None, {
+        "project_id": pid, "stage": "autotest", "instruction": instruction,
+        "context": context, "github_repo": project_repos.get(pid, ""),
+    })
+
+
+async def _retry_release_with_feedback(pipeline: Pipeline, feedback: str):
+    """AutoTest→Release 게이트에서 "No"를 눌러 릴리즈만 다시 돌릴 때 쓰는 함수.
+    release는 implement/qa/autotest처럼 전역 싱글턴이 아니라 TeamSpawner가 프로젝트마다
+    격리해서 띄우는 컨테이너이므로(GLOBAL_SHARED_AGENTS에 없음) stream_project_id를
+    None이 아니라 project_id로 넘겨야 큐가 프로젝트별로 분리된다."""
+    pid = pipeline.project_id
+    pipeline.stages["release"].status = StageStatus.PENDING
+    pipeline.stages["release"].outputs = {}
+
+    context = _completed_context(pipeline)
+    instruction = pipeline.instruction
+    if feedback:
+        instruction += f"\n\n[Release 재실행 요청] {feedback}"
+
+    pipeline.mark_running("release")
+    await broadcast({"type": "stage_update", "project_id": pid, "stage": "release", "status": "running"})
+    await redis.send_task("release", pid, {
+        "project_id": pid, "stage": "release", "instruction": instruction,
+        "context": context, "github_repo": project_repos.get(pid, ""),
+    })
+
+
+def _reset_stage_cascade(pipeline: Pipeline, stage_name: str):
+    """플로우차트 탭의 "폐기" 버튼 — stage_name과 그 이후로 의존하는 모든 스테이지를
+    PENDING/빈 outputs/미승인으로 되돌린다(기존 _retry_planning_with_feedback/
+    _retry_design_with_feedback의 cascade 리셋과 동일 패턴). advance_pipeline은
+    일부러 호출하지 않는다 — 그래야 파이프라인이 그 자리에 멈춘 채로, 프론트가
+    stages 상태만 보고 "직전에 완료된 스테이지"의 결정 블록을 다시 활성 상태로
+    그릴 수 있다(별도의 '커서' 개념을 서버에 만들지 않기 위함)."""
+    order = ["planning", "design", "implement", "qa", "autotest", "release"]
+    idx = order.index(stage_name)
+    for name in order[idx:]:
+        stage = pipeline.stages[name]
+        stage.status = StageStatus.PENDING
+        stage.outputs = {}
+        stage.approved = False
+
+
 async def advance_pipeline(pipeline: Pipeline):
     # 프로젝트 전용 팀(pm/designer/architect/release) 컨테이너가 없으면(수동으로
     # 지웠다가 재기동을 깜빡한 경우 등) 여기서 항상 먼저 보장한다 — 실제로 오늘
@@ -947,10 +1077,15 @@ def _make_project_info(pid: str) -> dict:
     p = projects[pid]
     return {
         **p.summary(),
+        # 플로우차트 탭의 PM 노드 Input(스프린트 지시사항 편집)에 필요 — 예전엔
+        # _save_project가 디스크 스냅샷에만 따로 붙여서, 재시작 복원 전에는
+        # 프론트가 살아있는 API로 이 값을 받을 방법이 없었다.
+        "instruction": p.instruction,
         "name":     project_names.get(pid, pid),
         "repo":     project_repos.get(pid, ""),
         "messages": project_messages.get(pid, []),
         "jira":     project_jira.get(pid, {}),
+        "token_totals": project_token_totals.get(pid, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}),
     }
 
 
@@ -1257,13 +1392,22 @@ async def list_github_repos():
         if repo["full_name"] not in connected
     ]
 
+class GateApprove(BaseModel):
+    # 플로우차트 탭의 "Go"(디자이너 등 추가 입력박스가 있는 승인) — 채워져 있으면
+    # 다음 스테이지가 시작되기 전에 pipeline.instruction에 덧붙인다. "Yes"는 body
+    # 없이 이 엔드포인트를 그대로 호출하면 됨(기존 동작과 동일).
+    extra_input: str | None = None
+
 @app.post("/projects/{project_id}/approve/{stage_name}")
-async def approve_stage(project_id: str, stage_name: str):
+async def approve_stage(project_id: str, stage_name: str, body: GateApprove = GateApprove()):
     p = projects.get(project_id)
     if not p:
         raise HTTPException(404)
+    if body.extra_input:
+        p.instruction += f"\n\n[{stage_name} 추가 요청] {body.extra_input}"
     p.approve(stage_name)
     await advance_pipeline(p)
+    await _add_history(project_id, f"✓ '{stage_name}' 게이트 승인" + (f" (추가 요청: {body.extra_input})" if body.extra_input else ""))
     return {"ok": True}
 
 
@@ -1456,6 +1600,63 @@ async def retry_implement(project_id: str, body: RetryFeedback):
         raise HTTPException(404)
     await _retry_implement_with_feedback(p, body.feedback, body.scenario_key)
     return {"ok": True}
+
+
+class StageRerun(BaseModel):
+    feedback: str = ""
+
+_RERUN_NO_CHANGE_TEXT = "(변경 없음 — 같은 내용으로 재실행)"
+
+@app.post("/projects/{project_id}/stage/{stage_name}/rerun")
+async def rerun_stage(project_id: str, stage_name: str, body: StageRerun):
+    """플로우차트 탭 결정 블록의 "Run" — 입력을 수정했든 안 했든, 그 스테이지를
+    같은 자리에서 다시 돌린다(다음 스테이지로 넘어가지 않음). planning/design/
+    implement는 기존 retry-* 엔드포인트가 쓰던 헬퍼를 그대로 재사용하고,
+    qa/autotest/release는 이번에 추가한 헬퍼로 위임한다."""
+    p = projects.get(project_id)
+    if not p:
+        raise HTTPException(404)
+    feedback = body.feedback.strip() or _RERUN_NO_CHANGE_TEXT
+
+    if stage_name == "planning":
+        await _retry_planning_with_feedback(p, feedback, full_rewrite=False)
+    elif stage_name == "design":
+        await _retry_design_with_feedback(p, feedback)
+    elif stage_name == "implement":
+        await _retry_implement_with_feedback(p, feedback)
+    elif stage_name == "qa":
+        await _retry_qa_with_feedback(p, body.feedback.strip())
+    elif stage_name == "autotest":
+        await _retry_autotest_with_feedback(p, body.feedback.strip())
+    elif stage_name == "release":
+        await _retry_release_with_feedback(p, body.feedback.strip())
+    else:
+        raise HTTPException(400, f"알 수 없는 스테이지: {stage_name}")
+
+    await _add_history(project_id, f"↺ '{stage_name}' 재실행: {feedback}")
+    return {"ok": True}
+
+
+_DISCARDABLE_STAGES = ("design", "implement", "qa", "autotest", "release")
+
+@app.post("/projects/{project_id}/stage/{stage_name}/discard")
+async def discard_stage(project_id: str, stage_name: str):
+    """플로우차트 탭 결정 블록의 "폐기" — 이 스테이지와 그 이후 전부를 미실행 상태로
+    되돌리고 파이프라인을 그 자리에 멈춰둔다(advance_pipeline 호출 안 함). planning은
+    첫 스테이지라 되돌아갈 이전 단계가 없으므로 대상에서 제외."""
+    if stage_name not in _DISCARDABLE_STAGES:
+        raise HTTPException(400, f"'{stage_name}'은(는) 폐기할 수 없습니다")
+    p = projects.get(project_id)
+    if not p:
+        raise HTTPException(404)
+    _reset_stage_cascade(p, stage_name)
+    await _add_history(project_id, f"✗ '{stage_name}' 폐기 — 이전 단계로 되돌림")
+    await broadcast({
+        "type": "project_updated", "project_id": project_id,
+        "projects": {project_id: _make_project_info(project_id)},
+    })
+    return {"ok": True}
+
 
 @app.post("/projects/{project_id}/deactivate")
 async def deactivate_project(project_id: str):

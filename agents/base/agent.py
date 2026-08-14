@@ -103,6 +103,20 @@ MAX_CONTINUATIONS = 5  # max_tokens에 걸려도 최대 이만큼 "이어서 작
 MODEL      = AGENT_MODELS.get(AGENT_NAME, os.getenv("LLM_MODEL", "claude-sonnet-4-6"))
 MAX_TOKENS = AGENT_MAX_TOKENS.get(AGENT_NAME, _SONNET_MAX)
 
+# ── 토큰 비용($) — 플로우차트 탭 게이트에 스테이지별 사용량을 보여주기 위함 ──
+# USD / 1M 토큰. 모델이 바뀌면 이 표도 같이 갱신해야 함(자동 조회 API는 없음).
+_TOKEN_PRICE_PER_MTOK = {
+    "claude-sonnet-4-6":          (3.0, 15.0),
+    "claude-haiku-4-5-20251001":  (1.0, 5.0),
+}
+
+def _cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    price = _TOKEN_PRICE_PER_MTOK.get(model)
+    if not price:
+        return None
+    in_rate, out_rate = price
+    return round(input_tokens * in_rate / 1_000_000 + output_tokens * out_rate / 1_000_000, 6)
+
 
 def build_summary(full_response: str, agent_name: str) -> str:
     """예전엔 400자 → 6000자로 상한을 올렸다가도 다시 잘리는 사고가 반복됐다 —
@@ -441,6 +455,10 @@ async def process_task(r: aioredis.Redis, task: dict):
     client = anthropic.AsyncAnthropic(api_key=API_KEY)
     full_response = ""
     conv_messages = [{"role": "user", "content": user_prompt}]
+    # max_tokens continuation(재시도)이 여러 번 일어날 수 있어 이번 스테이지 실행
+    # 전체의 토큰을 합산한다 — 마지막 시도분만 남기면 실제 쓴 비용보다 적게 보임.
+    total_input_tokens = 0
+    total_output_tokens = 0
 
     # MAX_TOKENS를 모델의 절대 상한까지 올려놔도, 이론적으로는 그 상한 자체에
     # 걸려서 잘릴 수 있다 — 그 경우 조용히 잘린 채로 끝내지 않고, 지금까지 쓴
@@ -465,6 +483,9 @@ async def process_task(r: aioredis.Redis, task: dict):
                         "message": full_response[-80:],
                     })
             final_message = await stream.get_final_message()
+
+        total_input_tokens  += final_message.usage.input_tokens
+        total_output_tokens += final_message.usage.output_tokens
 
         if final_message.stop_reason != "max_tokens":
             break
@@ -533,7 +554,12 @@ async def process_task(r: aioredis.Redis, task: dict):
         "agent":        AGENT_NAME,
         "summary":      summary,
         "self_improve": project_id == "self-improve",
+        "input_tokens":  total_input_tokens,
+        "output_tokens": total_output_tokens,
     }
+    cost = _cost_usd(MODEL, total_input_tokens, total_output_tokens)
+    if cost is not None:
+        outputs["cost_usd"] = cost
     # design 스테이지는 designer+architect 둘이 같은 stage_completed를 보내고
     # orchestrator가 outputs를 merge한다 — architect도 매번 "design_preview": False를
     # 보내면 나중에 끝나는 쪽이 designer가 만든 True를 덮어써버린다. designer가
