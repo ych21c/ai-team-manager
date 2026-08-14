@@ -1,0 +1,188 @@
+version: "3.9"
+
+networks:
+  dev-team-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  shared-workspace:
+
+# pm/designer/architect/qa/release는 여기 정적 서비스로 두지 않는다 —
+# TeamSpawner(orchestrator/team_spawner.py)가 프로젝트마다 agents/base 이미지로
+# 격리된 컨테이너를 동적으로 띄운다. implement/autotest만 무겁거나(OpenHands)
+# 상태가 없어서(CI 폴링) 전역 싱글턴으로 아래에 정적 정의한다.
+
+services:
+
+  # ─── 인프라 ──────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    networks:
+      - dev-team-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-devteam}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devteam}
+      POSTGRES_DB: ${POSTGRES_DB:-devteam}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - dev-team-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devteam"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─── Orchestrator (FastAPI + WebSocket) ─────────────────────────
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://devteam:devteam@postgres:5432/devteam
+    ports:
+      - "8000:8000"
+    volumes:
+      - shared-workspace:/workspace
+      - ./orchestrator:/app
+      - /var/run/docker.sock:/var/run/docker.sock   # 프로젝트별 에이전트 동적 생성
+    networks:
+      - dev-team-net
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─── Web UI (Next.js) ────────────────────────────────────────────
+  web:
+    image: node:20-alpine
+    working_dir: /app
+    # web/Dockerfile의 `npm run build`가 이 디렉토리 컨텍스트에서 실행되면
+    # dev용 .next 캐시와 build 산출물(.next/standalone 등)이 섞여 RSC 매니페스트가
+    # 깨진다(React Client Manifest 에러 → 클라이언트 청크 404 → 사이드바 등 전체
+    # 인터랙션 먹통). 컨테이너 기동 때마다 .next를 지우고 dev 서버를 새로 띄워
+    # 이 오염이 남아있지 않게 한다.
+    command: sh -c "rm -rf .next && npm install && npm run dev"
+    environment:
+      ORCHESTRATOR_URL: http://orchestrator:8000   # server.js 리버스 프록시 대상
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./web:/app          # 소스 직접 마운트 → 저장하면 즉시 반영
+    networks:
+      - dev-team-net
+    depends_on:
+      - orchestrator
+    restart: unless-stopped
+
+  # ─── ngrok 터널 — 고정 URL ───────────────────────────────────────
+  tunnel-web:
+    image: ngrok/ngrok:latest
+    command: http web:3000 --domain=thrive-estate-vindicate.ngrok-free.dev --log=stdout
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    networks:
+      - dev-team-net
+    depends_on:
+      - web
+    restart: unless-stopped
+
+  # ─── URL Notifier — 터널 URL 수집 후 Slack/콘솔 출력 ────────────
+  url-notifier:
+    build:
+      context: ./url-notifier
+      dockerfile: Dockerfile
+    env_file: .env
+    networks:
+      - dev-team-net
+    depends_on:
+      - tunnel-web
+    restart: on-failure
+
+  # ─── Implement Agent (OpenHands SDK 기반 실제 코딩 에이전트) ─────
+  agent-implement:
+    build:
+      context: ./agents/implement_openhands
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      AGENT_NAME: implement
+      AGENT_ROLE: "Implementation Engineer"
+      REDIS_URL: redis://redis:6379
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-6}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - shared-workspace:/workspace
+      - .:/workspace/ai-team-manager:ro
+    networks:
+      - dev-team-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─── AutoTest Runner (GitHub Actions CI 결과 폴링) ────────────────
+  agent-autotest:
+    build:
+      context: ./agents/autotest_ci
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      AGENT_NAME: autotest
+      AGENT_ROLE: "Automated Test Runner"
+      REDIS_URL: redis://redis:6379
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - shared-workspace:/workspace
+    networks:
+      - dev-team-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─── QA Runner (Firebase Test Lab Robo 무작위 테스트) ──────────────
+  agent-qa:
+    build:
+      context: ./agents/qa_testlab
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      AGENT_NAME: qa
+      AGENT_ROLE: "QA Engineer"
+      REDIS_URL: redis://redis:6379
+      PYTHONUNBUFFERED: "1"
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/gcp-test-lab-key.json
+      FIREBASE_TEST_PROJECT: goodenough-test
+      TEST_LAB_RESULTS_BUCKET: gs://goodenough-test-qa-results
+    volumes:
+      - shared-workspace:/workspace
+      - ${GCP_TEST_LAB_KEY_PATH}:/secrets/gcp-test-lab-key.json:ro
+    networks:
+      - dev-team-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # 기본 64MB로는 AAPT2 데몬이 IPC용 공유메모리가 부족해 시작을 못 하고
+    # "Daemon startup failed"로 죽는다 (VM 전체 메모리를 늘려도 이건 별개
+    # 설정이라 안 고쳐짐 — counter-app에서 실제로 재현/확인함).
+    shm_size: '1gb'

@@ -1,0 +1,17 @@
+# Cloudflare Tunnel 설정 (고정 URL 사용 시)
+# cloudflared tunnel create ai-team-manager 으로 생성한 터널 설정
+
+tunnel: ai-team-manager   # 터널 이름
+credentials-file: /etc/cloudflared/creds.json
+
+ingress:
+  # Web UI → 메인 도메인
+  - hostname: atm.yourdomain.com
+    service: http://web:3000
+
+  # API → 서브도메인 (선택)
+  - hostname: atm-api.yourdomain.com
+    service: http://orchestrator:8000
+
+  # 나머지 요청 처리 (필수)
+  - service: http_status:404
