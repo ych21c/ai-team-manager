@@ -1,0 +1,53 @@
+name: test
+on: [pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare /workspace (agents write logs there at import time)
+        run: |
+          sudo mkdir -p /workspace/logs
+          sudo chmod -R 777 /workspace
+      - name: Install orchestrator deps
+        run: pip install -r orchestrator/requirements-dev.txt
+      - name: Run orchestrator tests
+        working-directory: orchestrator
+        env:
+          REDIS_URL: redis://localhost:6379
+        run: python -m pytest -q
+      - name: Install shared agent deps
+        run: pip install pytest pytest-asyncio redis httpx anthropic python-dotenv
+      - name: Run agents/base tests
+        working-directory: agents/base
+        run: python -m pytest -q
+      - name: Run agents/qa_testlab tests
+        working-directory: agents/qa_testlab
+        run: python -m pytest -q
+      - name: Run agents/autotest_ci tests
+        working-directory: agents/autotest_ci
+        run: python -m pytest -q
+      - name: Run agents/implement_openhands tests
+        working-directory: agents/implement_openhands
+        run: python -m pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install web deps
+        working-directory: web
+        run: npm ci
+      - name: Run web tests
+        working-directory: web
+        run: node --test test_format_time.js test_server.js test_reconcile_approvals.js
