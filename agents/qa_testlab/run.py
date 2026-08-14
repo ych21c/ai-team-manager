@@ -34,6 +34,27 @@ REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
 AGENT_NAME   = "qa"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+QA_MODEL = "claude-haiku-4-5-20251001"
+# USD / 1M 토큰(agents/base/agent.py의 표와 동일 — 모델 바뀌면 같이 갱신).
+_TOKEN_PRICE_PER_MTOK = {QA_MODEL: (1.0, 5.0)}
+
+def _cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None:
+    price = _TOKEN_PRICE_PER_MTOK.get(model)
+    if not price:
+        return None
+    in_rate, out_rate = price
+    return round(input_tokens * in_rate / 1_000_000 + output_tokens * out_rate / 1_000_000, 6)
+
+# 한 QA 태스크(process_task 한 번) 안에서 verify_scenarios/design_qa_check가 각각
+# 여러 번 Claude를 호출할 수 있어, 태스크 단위로 누적한다. asyncio 단일 태스크가
+# 끝까지 끝난 뒤에야 다음 태스크를 처리하므로(await 지점에서 교차 실행되긴 하지만
+# 이 프로세스는 태스크를 하나씩 순차 처리) 전역 카운터로도 안전 — process_task
+# 시작에서 리셋하고 끝에서 읽는다.
+_token_usage = {"input": 0, "output": 0}
+
+def _track_usage(resp):
+    _token_usage["input"]  += resp.usage.input_tokens
+    _token_usage["output"] += resp.usage.output_tokens
 GCLOUD_KEY_FILE      = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 FIREBASE_TEST_PROJECT = os.getenv("FIREBASE_TEST_PROJECT", "goodenough-test")
 TEST_DEVICE  = os.getenv("TEST_LAB_DEVICE", "model=MediumPhone.arm,version=34,locale=en,orientation=portrait")
@@ -219,7 +240,8 @@ def parse_gcloud_output(stdout: str, stderr: str) -> dict:
 
 
 def _finalize_qa_outputs(result: dict, video_ok: bool, manual_count: int,
-                          design_mismatch_feedback: str | None) -> dict:
+                          design_mismatch_feedback: str | None,
+                          token_usage: dict | None = None) -> dict:
     """기능(빌드+Robo)은 통과해도 디자인이 스펙과 다르면 needs_rework로 뒤집어서,
     QA가 판단만 하고 끝내지 않고 기존 QA 재작업 루프(_retry_implement_with_feedback,
     MAX_QA_RETRIES로 무한 루프 방지됨)를 그대로 타게 한다 — 예전엔 메시지만
@@ -237,6 +259,12 @@ def _finalize_qa_outputs(result: dict, video_ok: bool, manual_count: int,
         outputs["needs_rework"] = True
         outputs["feedback"] = design_mismatch_feedback
         outputs["summary"] = "디자인 QA 불일치"
+    if token_usage:
+        outputs["input_tokens"]  = token_usage["input"]
+        outputs["output_tokens"] = token_usage["output"]
+        cost = _cost_usd(QA_MODEL, token_usage["input"], token_usage["output"])
+        if cost is not None:
+            outputs["cost_usd"] = cost
     return outputs
 
 
@@ -527,10 +555,11 @@ Flutter 위젯 테스트 파일을 작성하세요.
 
     try:
         resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=QA_MODEL,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
+        _track_usage(resp)
         code, skip_reason = _extract_scenario_test_code(resp.content[0].text, resp.stop_reason)
         if skip_reason:
             print(f"[qa] 시나리오 테스트 추출 건너뜀: {skip_reason}")
@@ -664,10 +693,11 @@ Robo 테스트 중 캡처된 스크린샷입니다. 스펙에 명시된 레이�
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=QA_MODEL,
             max_tokens=512,
             messages=[{"role": "user", "content": content}],
         )
+        _track_usage(resp)
         text = resp.content[0].text
         return _extract_json_object(text)
     except Exception as e:
@@ -694,6 +724,7 @@ def _resolve_target_branch(context: dict) -> str | None:
 
 
 async def process_task(r: aioredis.Redis, task: dict):
+    _token_usage["input"] = _token_usage["output"] = 0
     project_id  = task.get("project_id", "")
     stage       = task.get("stage")
     instruction = task.get("instruction", "")
@@ -887,7 +918,7 @@ async def process_task(r: aioredis.Redis, task: dict):
     await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
                     "content": "\n".join(summary_lines)})
 
-    outputs = _finalize_qa_outputs(result, video_ok, manual_count, design_mismatch_feedback)
+    outputs = _finalize_qa_outputs(result, video_ok, manual_count, design_mismatch_feedback, _token_usage)
     await emit(r, {
         "type": "stage_completed", "project_id": project_id, "agent": AGENT_NAME, "stage": stage,
         "outputs": outputs,

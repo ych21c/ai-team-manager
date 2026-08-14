@@ -47,12 +47,18 @@ class Stage:
 
 PIPELINE_DEFINITION: list[Stage] = [
     Stage("planning",      ["pm"],                      depends_on=[]),
-    Stage("design",        ["designer", "architect"],   depends_on=["planning"]),
+    # PM 기획을 사람이 보고 승인해야 디자인이 시작되게 함 — 스프린트를 애자일하게
+    # 통제하려면 매 전환마다(구현 시작 직전 제외하고 자동으로 흘려보내던) 사람이
+    # 결과를 보고 넘어갈지 결정할 수 있어야 한다.
+    Stage("design",        ["designer", "architect"],   depends_on=["planning"], requires_approval=True),
     # 디자인 목업을 사람이 직접 보고 승인해야 구현이 시작되게 함 — 승인 없이
     # 바로 구현 들어가면 방향이 틀렸을 때 코드까지 다 만들고 나서야 알게 됨.
     Stage("implement",     ["implement"],               depends_on=["design"], requires_approval=True),
+    # implement→qa는 게이트 없이 자동 진행 — QA는 구현 산출물을 바로 검증하는
+    # 단계라 사람이 매번 끼어들 필요가 적다는 판단.
     Stage("qa",            ["qa"],                      depends_on=["implement"]),
-    Stage("autotest",      ["autotest"],                depends_on=["qa"]),
+    # QA 결과를 사람이 보고 승인해야 오토테스트(CI)가 시작되게 함.
+    Stage("autotest",      ["autotest"],                depends_on=["qa"], requires_approval=True),
     Stage("release",       ["release"],                 depends_on=["autotest"], requires_approval=True),
 ]
 

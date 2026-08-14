@@ -135,8 +135,10 @@ def ensure_ci_workflow(workspace: str) -> bool:
     return True
 
 
-def run_openhands_task(workspace: str, instruction: str, project_id: str, is_retry: bool, scenario_key: str | None = None) -> int:
-    """OpenHands Conversation을 (동기적으로) 실행. 블로킹 호출이므로 to_thread로 감싸서 호출한다."""
+def run_openhands_task(workspace: str, instruction: str, project_id: str, is_retry: bool, scenario_key: str | None = None) -> tuple[int, dict]:
+    """OpenHands Conversation을 (동기적으로) 실행. 블로킹 호출이므로 to_thread로 감싸서 호출한다.
+    반환값의 두 번째 원소는 이번 실행의 토큰/비용(OpenHands SDK의 llm.metrics가 이미 누적
+    집계 — 플로우차트 탭 게이트에 표시하기 위함)."""
     llm = LLM(usage_id="implement", model=f"anthropic/{LLM_MODEL}", api_key=SecretStr(API_KEY))
     agent = Agent(
         llm=llm,
@@ -179,7 +181,13 @@ def run_openhands_task(workspace: str, instruction: str, project_id: str, is_ret
         conversation.run()
     finally:
         conversation.close()
-    return len(events)
+    usage = llm.metrics.accumulated_token_usage
+    token_usage = {
+        "input_tokens":  usage.prompt_tokens,
+        "output_tokens": usage.completion_tokens,
+        "cost_usd":      llm.metrics.accumulated_cost,
+    }
+    return len(events), token_usage
 
 
 async def process_task(r: aioredis.Redis, task: dict):
@@ -242,7 +250,7 @@ async def process_task(r: aioredis.Redis, task: dict):
                     "content": f"🤖 OpenHands 실행 중... (브랜치: {branch})"})
 
     try:
-        event_count = await asyncio.to_thread(run_openhands_task, workspace, instruction, project_id, bool(retry_branch), scenario_key)
+        event_count, token_usage = await asyncio.to_thread(run_openhands_task, workspace, instruction, project_id, bool(retry_branch), scenario_key)
         await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
                         "content": f"✅ OpenHands 작업 완료 ({event_count}개 이벤트)"})
     except Exception as e:
@@ -259,7 +267,7 @@ async def process_task(r: aioredis.Redis, task: dict):
         await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
                         "content": "ℹ️ 변경된 파일이 없습니다 — PR 생략."})
         await emit(r, {"type": "stage_completed", "project_id": project_id, "agent": AGENT_NAME,
-                        "stage": stage, "outputs": {"agent": AGENT_NAME, "summary": "변경사항 없음"}})
+                        "stage": stage, "outputs": {"agent": AGENT_NAME, "summary": "변경사항 없음", **token_usage}})
         return
 
     run(["git", "add", "-A"], cwd=workspace)
@@ -278,7 +286,7 @@ async def process_task(r: aioredis.Redis, task: dict):
                         "content": f"⚠️ 브랜치는 push했지만 PR 생성에 실패했습니다: {branch}"})
         await emit(r, {"type": "stage_completed", "project_id": project_id, "agent": AGENT_NAME,
                         "stage": stage, "outputs": {"agent": AGENT_NAME, "summary": "PR 생성 실패",
-                                                     "branch": branch, "head_sha": head_sha}})
+                                                     "branch": branch, "head_sha": head_sha, **token_usage}})
         return
 
     await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
@@ -292,6 +300,7 @@ async def process_task(r: aioredis.Redis, task: dict):
             "pr_number": pr["number"],
             "pr_url": pr["html_url"],
             "head_sha": head_sha,
+            **token_usage,
         },
     })
 

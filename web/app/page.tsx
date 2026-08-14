@@ -14,18 +14,23 @@ interface StageOutputs {
   summary?: string; branch?: string; pr_number?: number; pr_url?: string;
   head_sha?: string; passed?: boolean; video_available?: boolean; agent?: string;
   design_preview?: boolean;
+  input_tokens?: number; output_tokens?: number; cost_usd?: number;
+  needs_rework?: boolean; feedback?: string;
 }
-interface StageInfo { status: string; agents: string[]; outputs?: StageOutputs; }
+interface StageInfo { status: string; agents: string[]; outputs?: StageOutputs; approved?: boolean; }
 interface Message {
   id: string; from: string; content: string; ts: number; video?: string;
 }
 interface JiraInfo {
   epic?: string; stories?: string[]; confluence_url?: string; jira_url?: string;
 }
+interface TokenTotals { input_tokens: number; output_tokens: number; cost_usd: number; }
 interface Project {
   id: string; name: string; repo?: string;
   stages?: Record<string, StageInfo>;
   jira?: JiraInfo;
+  token_totals?: TokenTotals;
+  instruction?: string;
 }
 interface ApprovalRequest {
   project_id: string; stage: string; message: string;
@@ -132,41 +137,66 @@ function StatusBadge({ status }: { status: AgentStatus }) {
   return <span style={{ background: bg, color, fontSize: 11, padding: "2px 8px", borderRadius: 20, whiteSpace: "nowrap" }}>{label[status]}</span>;
 }
 
+// ── 에이전트 실행 로그 뷰어 (DetailPanel + 플로우차트 노드 공용) ──────
+// live=true면 2.5초마다 재조회(스테이지가 running일 때만 의미 있음), 아니면
+// 클릭 시 1회만 조회 — 새 백엔드 스트리밍 없이 기존 GET /agent-log/{agent} 폴링만 추가.
+function AgentLogView({ projectId, agent, live }: { projectId: string; agent: string; live: boolean }) {
+  const [lines, setLines]     = useState<string[]>([]);
+  const [shared, setShared]   = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    const fetchLog = async () => {
+      try {
+        const r = await fetch(`${API_URL}/projects/${projectId}/agent-log/${agent}`);
+        if (r.ok && !cancelled) {
+          const d = await r.json();
+          setLines(d.lines ?? []);
+          setShared(!!d.shared);
+        }
+      } catch {} finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    fetchLog();
+    if (!live) return () => { cancelled = true; };
+    const interval = setInterval(fetchLog, 2500);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [projectId, agent, live]);
+
+  return (
+    <div>
+      <div style={{ fontSize: 11, fontWeight: 500, color: "#aaa", marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span>{AGENT_META[agent]?.label ?? agent} 로그{live && " · 실시간"}</span>
+        {shared && <span style={{ color: "#bbb", fontWeight: 400 }}>공유 에이전트 — 다른 프로젝트 로그 섞일 수 있음</span>}
+      </div>
+      <pre style={{
+        background: "#1a1a1a", color: "#ddd", fontSize: 10.5, lineHeight: 1.6, padding: 10, borderRadius: 8,
+        maxHeight: 320, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-all", margin: 0,
+      }}>
+        {loading ? "불러오는 중..." : (lines.length ? lines.join("\n") : "로그 없음")}
+      </pre>
+    </div>
+  );
+}
+
 // ── 상세 패널 (팀 현황 + 로그 + PR, 우측 슬라이드 오버레이) ──────────
 function DetailPanel({ open, onClose, agents, projectId }: {
   open: boolean; onClose: () => void; agents: AgentState[]; projectId: string;
 }) {
   const [detail, setDetail]         = useState<Project | null>(null);
   const [logAgent, setLogAgent]     = useState<string | null>(null);
-  const [logLines, setLogLines]     = useState<string[]>([]);
-  const [logShared, setLogShared]   = useState(false);
-  const [logLoading, setLogLoading] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setLogAgent(null);
-    setLogLines([]);
     fetch(`${API_URL}/projects/${projectId}`)
       .then(r => (r.ok ? r.json() : null))
       .then(d => d && setDetail(d))
       .catch(() => {});
   }, [open, projectId]);
-
-  const viewLog = async (agent: string) => {
-    setLogAgent(agent);
-    setLogLoading(true);
-    setLogLines([]);
-    try {
-      const r = await fetch(`${API_URL}/projects/${projectId}/agent-log/${agent}`);
-      if (r.ok) {
-        const d = await r.json();
-        setLogLines(d.lines ?? []);
-        setLogShared(!!d.shared);
-      }
-    } catch {} finally {
-      setLogLoading(false);
-    }
-  };
 
   const prEntries = Object.entries(detail?.stages ?? {}).filter(
     ([, s]) => s.outputs && (s.outputs.pr_url || s.outputs.branch)
@@ -204,7 +234,7 @@ function DetailPanel({ open, onClose, agents, projectId }: {
                       </span>
                       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                         <StatusBadge status={agent.status} />
-                        <button onClick={() => viewLog(agent.name)}
+                        <button onClick={() => setLogAgent(agent.name)}
                           style={{ fontSize: 10.5, padding: "2px 6px", borderRadius: 4, border: "0.5px solid #d5d5d5", background: logAgent === agent.name ? "#EEEDFE" : "#fff", color: "#7F77DD", cursor: "pointer" }}>
                           로그
                         </button>
@@ -240,18 +270,8 @@ function DetailPanel({ open, onClose, agents, projectId }: {
 
           {/* 로그 뷰어 */}
           {logAgent && (
-            <div>
-              <div style={{ fontSize: 11, fontWeight: 500, color: "#aaa", marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span>{AGENT_META[logAgent]?.label ?? logAgent} 로그</span>
-                {logShared && <span style={{ color: "#bbb", fontWeight: 400 }}>공유 에이전트 — 다른 프로젝트 로그 섞일 수 있음</span>}
-              </div>
-              <pre style={{
-                background: "#1a1a1a", color: "#ddd", fontSize: 10.5, lineHeight: 1.6, padding: 10, borderRadius: 8,
-                maxHeight: 320, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-all", margin: 0,
-              }}>
-                {logLoading ? "불러오는 중..." : (logLines.length ? logLines.join("\n") : "로그 없음")}
-              </pre>
-            </div>
+            <AgentLogView projectId={projectId} agent={logAgent}
+              live={agents.find(a => a.name === logAgent)?.status === "running"} />
           )}
         </div>
       </div>
@@ -431,6 +451,302 @@ function DesignPanel({ open, onClose, projectId }: {
         </div>
       </div>
     </>
+  );
+}
+
+// ── 스프린트 플로우차트 탭 ────────────────────────────────────────────
+// PM→Design→Implement→QA→AutoTest→Release 파이프라인을 순서도로 보여주고,
+// 게이트(design/implement/autotest/release 시작 전)마다 No(입력 수정)/Run(재실행)/
+// 폐기/Yes·Go(승인) 결정 블록을 둔다. implement→qa 사이는 게이트 없이 자동 진행.
+const PIPELINE_ORDER = ["planning", "design", "implement", "qa", "autotest", "release"] as const;
+type StageName = typeof PIPELINE_ORDER[number];
+const STAGE_DEPENDS_ON: Partial<Record<StageName, StageName>> = {
+  design: "planning", implement: "design", qa: "implement", autotest: "qa", release: "autotest",
+};
+// 이 스테이지들 앞에는 사람 승인 게이트가 있다(orchestrator/workflows/pipeline.py의
+// requires_approval과 동일해야 함) — design/autotest는 이번에 새로 추가된 게이트,
+// implement/release는 기존 게이트.
+const GATED_STAGES = new Set<StageName>(["design", "implement", "autotest", "release"]);
+const STAGE_META: Record<StageName, { label: string; agents: string[] }> = {
+  planning:  { label: "PM",        agents: ["pm"] },
+  design:    { label: "Design",    agents: ["designer", "architect"] },
+  implement: { label: "Implement", agents: ["implement"] },
+  qa:        { label: "QA",        agents: ["qa"] },
+  autotest:  { label: "AutoTest",  agents: ["autotest"] },
+  release:   { label: "Release",   agents: ["release"] },
+};
+
+// 서버 status만 보고 "지금 사람이 봐야 할 지점"을 순수 계산한다 — waiting_approval이든
+// (정상 흐름) 폐기 직후의 pending+outputs 비어있음이든 이 함수 하나로 동일하게
+// 처리되므로, 폐기가 "이전 스텝으로 돌아간" 것처럼 자연스럽게 보인다.
+function getActiveGateStage(stages: Record<string, StageInfo> | undefined): StageName | null {
+  if (!stages) return null;
+  for (const name of PIPELINE_ORDER) {
+    const s = stages[name];
+    if (s?.status !== "completed") {
+      const dep = STAGE_DEPENDS_ON[name];
+      const depDone = !dep || stages[dep]?.status === "completed";
+      return depDone ? name : null;
+    }
+  }
+  return null; // 전부 완료
+}
+
+function gateIsPending(stages: Record<string, StageInfo> | undefined, gate: StageName): boolean {
+  const s = stages?.[gate];
+  if (!s) return false;
+  if (s.status === "waiting_approval") return true;
+  if (s.status === "pending") {
+    const dep = STAGE_DEPENDS_ON[gate];
+    return !dep || stages?.[dep]?.status === "completed";
+  }
+  return false;
+}
+
+function tokenBadgeText(outputs?: StageOutputs): string {
+  if (outputs?.input_tokens === undefined && outputs?.output_tokens === undefined) return "—";
+  const cost = outputs.cost_usd !== undefined ? ` · $${outputs.cost_usd.toFixed(4)}` : "";
+  return `🔤 ${outputs.input_tokens ?? 0} in · ${outputs.output_tokens ?? 0} out${cost}`;
+}
+
+const flowBtnStyle: CSSProperties = {
+  padding: "6px 12px", fontSize: 12, borderRadius: 6, cursor: "pointer", border: "0.5px solid #e5e5e5",
+};
+
+function DecisionBlock({ editTarget, gateTarget, stages, draft, setDraft, editing, setEditing, busy, onRun, onDiscard, onApprove }: {
+  editTarget: StageName; gateTarget: StageName; stages: Record<string, StageInfo> | undefined;
+  draft: Record<string, string>; setDraft: (fn: (d: Record<string, string>) => Record<string, string>) => void;
+  editing: Record<string, boolean>; setEditing: (fn: (d: Record<string, boolean>) => Record<string, boolean>) => void;
+  busy: Record<string, boolean>;
+  onRun: (stage: string, feedback: string) => void;
+  onDiscard: (stage: string) => void;
+  onApprove: (stage: string, extraInput?: string) => void;
+}) {
+  const [extra, setExtra] = useState("");
+  const isEditing = !!editing[editTarget];
+  const editOutputs = stages?.[editTarget]?.outputs;
+
+  if (isEditing) {
+    return (
+      <div style={{ margin: "2px 0 2px 26px", padding: "10px 12px", background: "#FAFAFA", border: "0.5px dashed #d5d5d5", borderRadius: 8, display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ fontSize: 11, color: "#888" }}>'{STAGE_META[editTarget].label}' 다시 실행 — 수정 요청 내용을 적으세요</div>
+        <textarea value={draft[editTarget] ?? ""} onChange={e => setDraft(d => ({ ...d, [editTarget]: e.target.value }))}
+          rows={3} placeholder="예: 버튼 색상이 스펙과 달라요"
+          style={{ width: "100%", padding: "8px 10px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12.5, fontFamily: "inherit", resize: "vertical", boxSizing: "border-box" }} />
+        <div style={{ display: "flex", gap: 6 }}>
+          <button onClick={() => setEditing(v => ({ ...v, [editTarget]: false }))}
+            style={{ ...flowBtnStyle, background: "#f5f4f0", color: "#666" }}>취소</button>
+          <button onClick={() => onRun(editTarget, draft[editTarget] ?? "")} disabled={busy[editTarget]}
+            style={{ ...flowBtnStyle, background: "#7F77DD", border: "none", color: "#fff", fontWeight: 500 }}>
+            {busy[editTarget] ? "실행 중..." : "▶ Run"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ margin: "2px 0 2px 26px", padding: "8px 12px", background: "#FAFAFA", border: "0.5px dashed #d5d5d5", borderRadius: 8, display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+      <button onClick={() => {
+        setEditing(v => ({ ...v, [editTarget]: true }));
+        setDraft(d => ({ ...d, [editTarget]: editOutputs?.feedback ?? "" }));
+      }} style={{ ...flowBtnStyle, background: "#fff", color: "#666" }}>No</button>
+      <button onClick={() => onDiscard(gateTarget)} disabled={busy[gateTarget]}
+        style={{ ...flowBtnStyle, background: "#FCEBEB", borderColor: "#F0C6C6", color: "#A32D2D" }}>폐기</button>
+      <button onClick={() => onApprove(gateTarget)} disabled={busy[gateTarget]}
+        style={{ ...flowBtnStyle, background: "#EAF3DE", borderColor: "#C0DD97", color: "#3B6D11", fontWeight: 500 }}>
+        {busy[gateTarget] ? "..." : "✓ Yes"}
+      </button>
+      <input value={extra} onChange={e => setExtra(e.target.value)} placeholder="추가 요청(선택)"
+        style={{ flex: 1, minWidth: 120, padding: "6px 8px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12 }} />
+      <button onClick={() => onApprove(gateTarget, extra)} disabled={busy[gateTarget]}
+        style={{ ...flowBtnStyle, background: "#F5F0FA", borderColor: "#D9C7EC", color: "#6B3FA0" }}>Go →</button>
+    </div>
+  );
+}
+
+function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpand, onOpenDesign,
+                    editing, onStartEdit, draft, setDraft, busy, onRun }: {
+  name: StageName; stageInfo?: StageInfo; projectId: string; isActive: boolean;
+  expanded: boolean; onToggleExpand: () => void; onOpenDesign: () => void;
+  editing: Record<string, boolean>; onStartEdit: (stage: string) => void;
+  draft: Record<string, string>;
+  setDraft: (fn: (d: Record<string, string>) => Record<string, string>) => void;
+  busy: Record<string, boolean>; onRun: (stage: string, feedback: string) => void;
+}) {
+  const meta = STAGE_META[name];
+  const agentMeta = AGENT_META[meta.agents[0]] ?? { label: meta.label, color: "#666", bg: "#f0f0f0" };
+  const status = (stageInfo?.status ?? "pending") as AgentStatus;
+  const outputs = stageInfo?.outputs;
+  // implement는 뒤(qa)에 게이트가 없어서 별도 결정 블록을 못 타므로, 완료된 뒤에도
+  // 직접 다시 돌릴 수 있는 인라인 재실행을 노드 자체에 둔다.
+  const showInlineRerun = name === "implement" && status === "completed";
+  const isInlineEditing = !!editing[name];
+
+  return (
+    <div style={{
+      background: "#f9f8f5", border: `0.5px solid ${isActive ? agentMeta.color : "#e5e5e5"}`,
+      borderRadius: 8, padding: "10px 12px",
+      boxShadow: isActive ? `0 0 0 2px ${agentMeta.bg}` : "none",
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }} onClick={onToggleExpand}>
+        <span style={{ fontSize: 13, fontWeight: 500, display: "flex", alignItems: "center", gap: 7 }}>
+          <span style={{ width: 8, height: 8, borderRadius: "50%", background: agentMeta.bg, border: `1.5px solid ${agentMeta.color}`, display: "inline-block" }} />
+          {meta.label}
+        </span>
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 10.5, color: "#aaa" }}>{tokenBadgeText(outputs)}</span>
+          <StatusBadge status={status} />
+          <span style={{ color: "#bbb", fontSize: 11 }}>{expanded ? "▲" : "▼"}</span>
+        </span>
+      </div>
+
+      {expanded && (
+        <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+          {name === "planning" ? null : (
+            <div style={{ fontSize: 11.5, color: "#999" }}>
+              게이트 통과 후 자동 시작 — 입력은 이전 스테이지 산출물
+            </div>
+          )}
+          {outputs?.summary && (
+            <div style={{ fontSize: 12, lineHeight: 1.6, background: "#fff", border: "0.5px solid #e5e5e5", borderRadius: 6, padding: "8px 10px", maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap" }}>
+              {String(outputs.summary).slice(0, 2000)}
+            </div>
+          )}
+          {(outputs?.pr_url || outputs?.branch) && (
+            <div style={{ fontSize: 11.5 }}>
+              {outputs?.pr_url
+                ? <a href={outputs.pr_url} target="_blank" rel="noreferrer" style={{ color: "#7F77DD" }}>{outputs.pr_url}</a>
+                : <span style={{ fontFamily: "monospace", color: "#666" }}>{outputs?.branch}</span>}
+            </div>
+          )}
+          {name === "design" && (
+            <button onClick={onOpenDesign} style={{ ...flowBtnStyle, alignSelf: "flex-start", background: "#fff" }}>🎨 디자인 보기</button>
+          )}
+          {status === "running" && (
+            <AgentLogView projectId={projectId} agent={meta.agents[0]} live />
+          )}
+          {showInlineRerun && (
+            isInlineEditing ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <textarea value={draft[name] ?? ""} onChange={e => setDraft(d => ({ ...d, [name]: e.target.value }))}
+                  rows={2} placeholder="재작업 요청 내용" style={{ width: "100%", padding: "6px 8px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12, fontFamily: "inherit", boxSizing: "border-box" }} />
+                <button onClick={() => onRun(name, draft[name] ?? "")} disabled={busy[name]}
+                  style={{ ...flowBtnStyle, alignSelf: "flex-start", background: "#7F77DD", border: "none", color: "#fff" }}>
+                  {busy[name] ? "실행 중..." : "▶ Run"}
+                </button>
+              </div>
+            ) : (
+              <button onClick={() => onStartEdit(name)}
+                style={{ ...flowBtnStyle, alignSelf: "flex-start", background: "#fff", color: "#666" }}>🔁 다시 실행</button>
+            )
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FlowchartTab({ project, projectId, onOpenDesign }: {
+  project: Project | undefined; projectId: string; onOpenDesign: () => void;
+}) {
+  const stages = project?.stages;
+  const activeGate = getActiveGateStage(stages);
+  const [draft, setDraft]     = useState<Record<string, string>>({});
+  const [editing, setEditing] = useState<Record<string, boolean>>({});
+  const [busy, setBusy]       = useState<Record<string, boolean>>({});
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [notice, setNotice]   = useState("");
+
+  const isExpanded = (name: StageName): boolean => {
+    if (expanded[name] !== undefined) return expanded[name];
+    if (name === activeGate) return true;
+    if (activeGate && STAGE_DEPENDS_ON[activeGate] === name) return true;
+    return false;
+  };
+
+  const post = async (path: string, body?: unknown) => {
+    const r = await fetch(`${API_URL}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body ?? {}),
+    });
+    if (!r.ok) {
+      const text = await r.text().catch(() => "");
+      throw new Error(text || `요청 실패 (${r.status})`);
+    }
+  };
+
+  const withBusy = async (key: string, fn: () => Promise<void>) => {
+    setBusy(b => ({ ...b, [key]: true }));
+    setNotice("");
+    try {
+      await fn();
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : "요청 실패");
+    } finally {
+      setBusy(b => ({ ...b, [key]: false }));
+    }
+  };
+
+  const runStage = (stage: string, feedback: string) => withBusy(stage, async () => {
+    await post(`/projects/${projectId}/stage/${stage}/rerun`, { feedback });
+    setEditing(v => ({ ...v, [stage]: false }));
+  });
+  const discardStage = (stage: string) => withBusy(stage, () => post(`/projects/${projectId}/stage/${stage}/discard`));
+  const approveStage = (stage: string, extraInput?: string) => withBusy(stage, () =>
+    post(`/projects/${projectId}/approve/${stage}`, extraInput ? { extra_input: extraInput } : {}));
+
+  const totals = project?.token_totals;
+
+  return (
+    <div style={{ flex: 1, overflowY: "auto", padding: "16px 20px", display: "flex", flexDirection: "column", gap: 4 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <div style={{ fontSize: 11, color: "#aaa" }}>PM → Design → Implement → QA → AutoTest → Release</div>
+        <div style={{ fontSize: 11, color: "#aaa" }}>
+          누적: 🔤 {totals?.input_tokens ?? 0} in · {totals?.output_tokens ?? 0} out
+          {totals?.cost_usd ? ` · $${totals.cost_usd.toFixed(4)}` : ""}
+        </div>
+      </div>
+
+      {notice && (
+        <div style={{ fontSize: 12, color: "#A32D2D", background: "#FCEBEB", border: "0.5px solid #F0C6C6", borderRadius: 6, padding: "6px 10px", marginBottom: 4 }}>
+          {notice}
+        </div>
+      )}
+
+      {PIPELINE_ORDER.map((name, i) => {
+        const next = PIPELINE_ORDER[i + 1];
+        const nextGated = next && GATED_STAGES.has(next);
+        const showGate = nextGated && gateIsPending(stages, next);
+        return (
+          <div key={name}>
+            <FlowNode
+              name={name} stageInfo={stages?.[name]} projectId={projectId}
+              isActive={name === activeGate || (nextGated && next === activeGate)}
+              expanded={isExpanded(name)} onToggleExpand={() => setExpanded(v => ({ ...v, [name]: !isExpanded(name) }))}
+              onOpenDesign={onOpenDesign}
+              editing={editing} onStartEdit={n => setEditing(v => ({ ...v, [n]: true }))}
+              draft={draft} setDraft={setDraft} busy={busy}
+              onRun={runStage}
+            />
+            {next && (
+              showGate ? (
+                <DecisionBlock
+                  editTarget={name} gateTarget={next} stages={stages}
+                  draft={draft} setDraft={setDraft} editing={editing} setEditing={setEditing} busy={busy}
+                  onRun={runStage} onDiscard={discardStage} onApprove={approveStage}
+                />
+              ) : (
+                <div style={{ margin: "2px 0 2px 26px", fontSize: 11, color: "#ccc", padding: "2px 0" }}>
+                  {nextGated ? "↓" : "↓ 자동 진행"}
+                </div>
+              )
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -672,6 +988,8 @@ export default function Home() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [githubRepos, setGithubRepos] = useState<GithubRepo[]>([]);
   const [repoLoading, setRepoLoading] = useState(false);
+  // 플로우차트 탭이 기본값 — 사용자가 "첫번째 탭"으로 요청한 스프린트 흐름을 먼저 보여줌
+  const [activeTab, setActiveTab]     = useState<"flow" | "chat">("flow");
   const wsRef    = useRef<WebSocket | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -855,8 +1173,24 @@ export default function Home() {
       setApprovals(prev =>
         prev.some(a => a.project_id === req.project_id && a.stage === req.stage) ? prev : [...prev, req]
       );
+      // 여러 프로젝트를 동시에 돌리다 게이트 열린 걸 놓치기 쉬워서, 탭이
+      // 백그라운드일 때 타이틀에 대기 개수를 띄우고 브라우저 알림도 시도한다.
+      if (document.hidden && typeof Notification !== "undefined") {
+        if (Notification.permission === "default") Notification.requestPermission().catch(() => {});
+        if (Notification.permission === "granted") {
+          try {
+            new Notification("AI 개발팀 — 승인 대기", { body: req.message || `'${req.stage}' 게이트 승인 필요` });
+          } catch {}
+        }
+      }
     }
   }, [addMessage, addVideoMessage]);
+
+  // 대기 중인 게이트 개수를 탭 타이틀에 표시 — 백그라운드 탭에서도 한눈에 보이게.
+  useEffect(() => {
+    const pending = approvals.length;
+    document.title = pending > 0 ? `(${pending}) AI 개발팀` : "AI 개발팀";
+  }, [approvals.length]);
 
   const sendInstruction = () => {
     const text = input.trim();
@@ -931,6 +1265,26 @@ export default function Home() {
   const deactivateProject = async (projectId: string) => {
     await fetch(`${API_URL}/projects/${projectId}/deactivate`, { method: "POST" }).catch(() => {});
   };
+
+  // ── 탭 스위처 + 플로우차트 (공통, desktop/mobile 둘 다 씀) ────────
+  const tabBar = (
+    <div style={{ display: "flex", gap: 4, padding: "8px 20px 0", borderBottom: "0.5px solid #e5e5e5", flexShrink: 0 }}>
+      {(["flow", "chat"] as const).map(tab => (
+        <button key={tab} onClick={() => setActiveTab(tab)}
+          style={{
+            padding: "8px 14px", fontSize: 13, cursor: "pointer", border: "none", background: "transparent",
+            borderBottom: activeTab === tab ? "2px solid #7F77DD" : "2px solid transparent",
+            color: activeTab === tab ? "#4A3F9E" : "#888", fontWeight: activeTab === tab ? 500 : 400,
+          }}>
+          {tab === "flow" ? "🔀 스프린트 플로우" : "💬 대화"}
+        </button>
+      ))}
+    </div>
+  );
+
+  const flowchartContent = (
+    <FlowchartTab project={activeProject} projectId={activeId} onOpenDesign={() => setDesignOpen(true)} />
+  );
 
   // ── 채팅 영역 (공통) ──────────────────────────────────────────
   const curApprovals = approvals.filter(a => a.project_id === activeId);
@@ -1077,7 +1431,8 @@ export default function Home() {
                 <a href={`${API_URL}/docs`} target="_blank" rel="noreferrer" style={headerLinkStyle}>API 문서</a>
               </div>
             </div>
-            {chatContent}
+            {tabBar}
+            {activeTab === "flow" ? flowchartContent : chatContent}
           </div>
         </div>
 
@@ -1135,7 +1490,10 @@ export default function Home() {
             <div style={{ width: 8, height: 8, borderRadius: "50%", background: connected ? "#1D9E75" : "#E24B4A", flexShrink: 0 }} />
           </div>
 
-          <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>{chatContent}</div>
+          {tabBar}
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+            {activeTab === "flow" ? flowchartContent : chatContent}
+          </div>
         </div>
       </div>
     </>
