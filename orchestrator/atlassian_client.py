@@ -314,3 +314,31 @@ async def link_pr_to_jira(issue_key: str, pr_url: str, repo: str) -> bool:
             },
         )
         return r.status_code == 201
+
+
+async def add_jira_attachment(issue_key: str, file_path: str, filename: str | None = None) -> bool:
+    """Jira 이슈에 파일을 첨부한다. 링크와 달리, 나중에 로컬 파일이 다음 라운드
+    산출물로 덮어써지거나 지워져도(QA 녹화 영상 qa_recording.mp4처럼 매 라운드
+    같은 경로에 덮어쓰는 산출물이 실제로 있음) Jira 쪽엔 첨부 시점 버전이 그대로
+    영구 보존된다 — "이전 산출물" 이력을 지키는 유일한 방법이라 링크 대신 이걸
+    쓴다. 첨부 엔드포인트는 XSRF 우회용 X-Atlassian-Token 헤더가 필요하고
+    Content-Type을 절대 수동 지정하면 안 된다(httpx가 멀티파트 경계를 직접
+    잡아야 함) — 그래서 _auth_header()를 그대로 재사용하지 않고 필요한 헤더만
+    새로 구성한다."""
+    if not all([EMAIL, TOKEN, DOMAIN]) or not os.path.exists(file_path):
+        return False
+    creds = base64.b64encode(f"{EMAIL}:{TOKEN}".encode()).decode()
+    headers = {
+        "Authorization": f"Basic {creds}",
+        "X-Atlassian-Token": "no-check",
+        "Accept": "application/json",
+    }
+    name = filename or os.path.basename(file_path)
+    async with httpx.AsyncClient(timeout=60) as client:
+        with open(file_path, "rb") as f:
+            r = await client.post(
+                f"https://{DOMAIN}/rest/api/3/issue/{issue_key}/attachments",
+                headers=headers,
+                files={"file": (name, f)},
+            )
+        return r.status_code == 200

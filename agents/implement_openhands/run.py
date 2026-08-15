@@ -305,7 +305,8 @@ async def process_task(r: aioredis.Redis, task: dict):
         await emit(r, {"type": "stage_completed", "project_id": project_id, "agent": AGENT_NAME,
                         "stage": stage, "outputs": {"agent": AGENT_NAME, "summary": "PR 생성 실패",
                                                      "branch": branch, "head_sha": head_sha,
-                                                     "build_ok": build_ok, **token_usage}})
+                                                     "build_ok": build_ok, "scenario_key": scenario_key,
+                                                     **token_usage}})
         return
 
     await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
@@ -320,6 +321,10 @@ async def process_task(r: aioredis.Redis, task: dict):
             "pr_url": pr["html_url"],
             "head_sha": head_sha,
             "build_ok": build_ok,
+            # 오케스트레이터(main.py)가 이 PR 링크 코멘트를 어느 Jira 이슈에 달지
+            # 결정할 때 필요 — 범위가 특정 시나리오로 좁혀진 재작업(scenario_key
+            # 있음)이면 그 이슈 하나에만, 아니면(None) 전체 스토리에 단다.
+            "scenario_key": scenario_key,
             **token_usage,
         },
     })
