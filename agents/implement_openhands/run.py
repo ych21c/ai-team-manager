@@ -119,6 +119,11 @@ jobs:
       - run: flutter pub get
       - run: flutter analyze
       - run: flutter test
+      - name: Run QA scenario integration tests (if present)
+        run: |
+          if [ -d integration_test ]; then
+            flutter test integration_test/
+          fi
 """
 
 

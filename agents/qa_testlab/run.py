@@ -317,6 +317,48 @@ def _cap_gradle_memory(workspace: str):
         f.write("\n".join(lines) + "\n")
 
 
+def build_instrumentation_apks(workspace: str) -> tuple[bool, str, str | None, str | None]:
+    """SCENARIO_TEST_FILE(integration_test/scenario_test.dart)을 로컬 시뮬레이션
+    (flutter test)뿐 아니라 실제 기기(Firebase Test Lab)에서도 돌리기 위한 앱/테스트
+    APK 두 개를 빌드한다. `flutter build apk`는 androidTest APK를 만들어주지
+    않으므로, Flutter 공식 문서가 안내하는 대로 gradle을 직접 호출한다:
+    - `assembleAndroidTest`로 계측(instrumentation) 러너 APK를,
+    - `-Ptarget=`으로 진입점을 시나리오 테스트 파일로 지정한 `assembleDebug`로
+      "실행하면 앱이 아니라 이 테스트를 도는" 앱 APK를 만든다.
+    이 두 APK를 함께 제출해야 `gcloud firebase test android run --type instrumentation`이
+    동작한다(Robo용 일반 app-debug.apk와는 진입점이 다른 별개의 빌드).
+
+    빌드 자체가 실패하면(Android 프로젝트 구조/의존성 문제 등, 앱 로직과 무관한
+    인프라성 이슈일 수 있음) needs_rework로 몰아 재작업 루프를 낭비시키지 않도록,
+    process_task에서 이 실패는 차단이 아니라 보고만 하고 넘어가게 한다.
+
+    반환: (성공 여부, 실패 시 에러 요약, 성공 시 app apk 경로, 성공 시 test apk 경로)."""
+    android_dir = f"{workspace}/android"
+    if not os.path.isdir(android_dir):
+        return False, "android/ 디렉토리가 없음", None, None
+
+    test_apk_build = run(["./gradlew", "app:assembleAndroidTest"], cwd=android_dir, timeout=600)
+    if test_apk_build.returncode != 0:
+        return False, (
+            f"androidTest APK 빌드 실패:\n{test_apk_build.stdout[-800:]}\n{test_apk_build.stderr[-800:]}"
+        ), None, None
+
+    target_apk_build = run(
+        ["./gradlew", "app:assembleDebug", f"-Ptarget={workspace}/{SCENARIO_TEST_FILE}"],
+        cwd=android_dir, timeout=600,
+    )
+    if target_apk_build.returncode != 0:
+        return False, (
+            f"시나리오 진입점 앱 APK 빌드 실패:\n{target_apk_build.stdout[-800:]}\n{target_apk_build.stderr[-800:]}"
+        ), None, None
+
+    app_apk = f"{workspace}/build/app/outputs/apk/debug/app-debug.apk"
+    test_apk = f"{workspace}/build/app/outputs/apk/androidTest/debug/app-debug-androidTest.apk"
+    if not os.path.exists(app_apk) or not os.path.exists(test_apk):
+        return False, "빌드는 성공했지만 예상 경로에서 APK를 찾지 못함", None, None
+    return True, "", app_apk, test_apk
+
+
 # 파일 하나하나를 잘게 자르던 예전 방식(SOURCE_EXCERPT_PER_FILE_LIMIT=2000,
 # 그다음 6000)은 두 번이나 같은 사고를 냈다 — counter_screen.dart(9KB)의 버튼
 # 위젯 코드가 파일 뒷부분에 있었는데 앞부분만 잘려 들어가서, QA 시나리오 생성
@@ -448,7 +490,34 @@ def _extract_json_object(text: str) -> dict:
         return json.loads(m.group(1))
     return json.loads(text[text.find("{"):text.rfind("}") + 1])
 
-SCENARIO_TEST_FILE = "test/qa_scenarios_test.dart"
+SCENARIO_TEST_FILE = "integration_test/scenario_test.dart"
+
+
+def ensure_integration_test_dependency(workspace: str) -> bool:
+    """SCENARIO_TEST_FILE이 `integration_test` 패키지(IntegrationTestWidgetsFlutterBinding)를
+    쓰는데, `flutter create`가 만드는 기본 pubspec.yaml엔 이게 안 들어 있다 — 없으면
+    `flutter test`가 곧바로 "Target file ... integration_test 패키지 없음" 에러로
+    죽는다. LLM(OpenHands/생성 프롬프트)에게 pubspec을 알아서 고치라고 맡기지 않고
+    여기서 결정적으로 보장한다 — 한 번 빠뜨리면 이후 모든 QA 라운드가 계속
+    실패하는 사고로 이어지기 쉬운 종류의 설정이라서다. 이미 있으면 아무것도 안
+    건드린다(idempotent). 반환값은 실제로 추가했는지 여부(로그용)."""
+    path = f"{workspace}/pubspec.yaml"
+    if not os.path.exists(path):
+        return False
+    with open(path, errors="replace") as f:
+        lines = f.read().splitlines()
+    if any(re.match(r"^\s*integration_test\s*:", ln) for ln in lines):
+        return False
+
+    insertion = ["  integration_test:", "    sdk: flutter"]
+    dev_deps_idx = next((i for i, ln in enumerate(lines) if re.match(r"^dev_dependencies\s*:\s*$", ln)), None)
+    if dev_deps_idx is not None:
+        lines[dev_deps_idx + 1:dev_deps_idx + 1] = insertion
+    else:
+        lines += ["", "dev_dependencies:", *insertion]
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return True
 
 
 def _extract_scenario_test_code(text: str, stop_reason: str | None) -> tuple[str | None, str | None]:
@@ -533,9 +602,13 @@ Flutter 위젯 테스트 파일을 작성하세요.
 
 규칙:
 - `package:flutter/material.dart`, `package:flutter_test/flutter_test.dart`,
-  `package:{package_name}/main.dart` 세 개를 반드시 import하세요 — material.dart가
-  없으면 Scaffold/Column/ElevatedButton 같은 기본 위젯 이름을 못 찾아 컴파일이
-  실패합니다.
+  `package:integration_test/integration_test.dart`, `package:{package_name}/main.dart`
+  네 개를 반드시 import하세요 — material.dart가 없으면 Scaffold/Column/ElevatedButton
+  같은 기본 위젯 이름을 못 찾아 컴파일이 실패합니다. integration_test는 이 테스트를
+  로컬 시뮬레이션뿐 아니라 나중에 실제 기기(Firebase Test Lab)에서도 그대로 돌리기
+  위해 반드시 필요합니다.
+- `main()` 함수의 첫 줄은 반드시 `IntegrationTestWidgetsFlutterBinding.ensureInitialized();`
+  여야 합니다 — 이게 없으면 실제 기기에서 실행할 때 테스트가 즉시 실패합니다.
 - 시나리오 하나당 `testWidgets('사용자 관점 시나리오 이름', (tester) async {{ ... }})` 하나.
 - 실제로 `tester.pumpWidget(...)`, `tester.tap(...)`, `tester.pump()`, `expect(...)`로 동작을
   조작하고 검증하세요 — 클래스가 존재하는지만 확인하는 게 아니라 실제 동작을 확인해야 합니다.
@@ -580,6 +653,7 @@ Flutter 위젯 테스트 파일을 작성하세요.
     with open(test_path, "w") as f:
         f.write(code)
 
+    ensure_integration_test_dependency(workspace)
     result = run(["flutter", "test", SCENARIO_TEST_FILE], cwd=workspace, timeout=180)
     detail = f"{result.stdout[-1500:]}\n{result.stderr[-500:]}".strip()
     if result.returncode == 0:
@@ -832,6 +906,49 @@ async def process_task(r: aioredis.Redis, task: dict):
     if scenario.get("verdict") == "pass":
         await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
                         "content": f"✅ 시나리오 검증 통과: {scenario.get('detail', '')}"})
+
+        # 로컬 flutter test(시뮬레이션)만으로 끝내지 않고, 같은 테스트를 실제 기기
+        # (Firebase Test Lab instrumentation)에서 한 번 더 돌려 "결과물(빌드된 앱을
+        # 실기기에서 실행한 결과) 기반"으로 확인한다. 로컬 시뮬레이션과 실기기
+        # 사이엔 타이밍/실제 렌더링/플랫폼 채널 등 시뮬레이션이 못 잡는 차이가
+        # 있을 수 있어서다. 인프라성 빌드 실패(Android 프로젝트 구조 문제 등)는
+        # 앱 로직 버그가 아닐 수 있으므로 재작업을 강제하지 않고 보고만 한다 —
+        # 실제로 테스트가 "실행됐지만 실패"한 경우만 needs_rework로 취급한다.
+        await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                        "content": "📱 같은 시나리오 테스트를 실제 기기(Firebase Test Lab)에서 재확인합니다..."})
+        instr_ok, instr_detail, instr_app_apk, instr_test_apk = build_instrumentation_apks(workspace)
+        if not instr_ok:
+            await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                            "content": f"⚠️ 실기기 확인용 빌드 실패 — 로컬 시뮬레이션 결과만으로 계속 진행합니다: {instr_detail[:300]}"})
+        else:
+            instr_cmd = [
+                "gcloud", "firebase", "test", "android", "run",
+                "--type", "instrumentation",
+                "--app", instr_app_apk,
+                "--test", instr_test_apk,
+                "--device", TEST_DEVICE,
+                "--timeout", TEST_TIMEOUT,
+                "--project", FIREBASE_TEST_PROJECT,
+            ]
+            if TEST_LAB_RESULTS_BUCKET:
+                instr_cmd += ["--results-bucket", TEST_LAB_RESULTS_BUCKET]
+            instr_run = run(instr_cmd, timeout=900)
+            instr_result = parse_gcloud_output(instr_run.stdout, instr_run.stderr)
+            if instr_result["passed"]:
+                await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                                "content": f"✅ 실기기 시나리오 테스트 통과: {instr_result['summary']}"})
+            else:
+                feedback = (
+                    f"로컬 시뮬레이션(flutter test)은 통과했지만 실제 기기에서 같은 시나리오 테스트가 "
+                    f"실패했습니다 — 실기기에서만 드러나는 문제(타이밍, 실제 렌더링, 플랫폼 채널 등)일 "
+                    f"수 있습니다: {instr_result['summary']}"
+                )
+                await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                                "content": f"🔁 {feedback}"})
+                await emit(r, {"type": "stage_completed", "project_id": project_id, "agent": AGENT_NAME, "stage": stage,
+                                "outputs": {"agent": AGENT_NAME, "passed": False, "needs_rework": True,
+                                            "feedback": feedback, "summary": "실기기 시나리오 테스트 실패"}})
+                return
 
     build_cmd, rework_reason = determine_build_command(workspace)
     if rework_reason:
