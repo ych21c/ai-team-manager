@@ -32,11 +32,16 @@ from workflows.pipeline import Pipeline, StageStatus
 from team_spawner import TeamSpawner
 from atlassian_client import (
     sync_pm_output, update_jira_status, add_jira_comment, link_pr_to_jira,
-    create_confluence_page, update_confluence_page, create_jira_stories,
-    parse_pm_requirements,
+    add_jira_attachment, create_confluence_page, update_confluence_page,
+    create_jira_stories, parse_pm_requirements,
 )
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+# 디자인 목업 링크를 Jira 코멘트에 남길 때 쓰는 외부 접속 기준 URL. web/server.js가
+# "/"(SPA)와 "/_next/*" 말고는 전부 orchestrator로 그대로 프록시하므로
+# /design-file/*, /recordings/* 등 이 파일의 라우트는 이 도메인으로 바로
+# 열린다(ngrok 터널이 web:3000만 뚫고 있음 — docker-compose.yml의 tunnel-web 참고).
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://thrive-estate-vindicate.ngrok-free.dev")
 
 # implement(OpenHands, 무거움)/autotest(GitHub CI 폴러)/qa(Flutter SDK+gcloud,
 # 무거움)는 프로젝트별로 격리할 필요가 없어 docker-compose의 정적 싱글턴
@@ -356,10 +361,17 @@ async def handle_agent_event(event: dict):
             jira = project_jira.get(project_id, {})
             stories = jira.get("stories", [])
             pr_url = outputs.get("pr_url", "")
-            if stories:
-                await update_jira_status(stories[0], "In Progress")
-                comment = f"🤖 구현 완료 — PR: {pr_url}" if pr_url else f"⚠️ 구현 단계 완료했지만 PR 생성 실패: {outputs.get('summary', '')}"
-                await add_jira_comment(stories[0], comment)
+            # scenario_key로 범위가 좁혀진 재작업(예: 채팅 트리아지가 이슈 하나만
+            # 지목한 경우)이면 그 이슈에만 코멘트를 단다 — 예전엔 항상 stories[0]
+            # 하나에만 달아서, 두 번째 이후 이슈로 좁혀진 작업의 PR 링크가 엉뚱한
+            # (또는 이미 끝난) 첫 번째 이슈에 계속 쌓이는 문제가 있었다. 범위 제한이
+            # 없는 전체 작업(초기 구현 등)은 그 PR이 모든 스토리에 다 영향을 주므로
+            # 스토리 전체에 단다.
+            target_stories = _implement_jira_comment_targets(outputs.get("scenario_key"), stories)
+            comment = f"🤖 구현 완료 — PR: {pr_url}" if pr_url else f"⚠️ 구현 단계 완료했지만 PR 생성 실패: {outputs.get('summary', '')}"
+            for story in target_stories:
+                await update_jira_status(story, "In Progress")
+                await add_jira_comment(story, comment)
             await _add_history(project_id, f"🤖 구현 완료 — PR: {pr_url}" if pr_url else "⚠️ 구현 완료했지만 PR 생성 실패")
 
         # QA 완료 → PR 링크 + 결과 코멘트 (통과 여부와 무관하게 무조건 Done으로
@@ -371,11 +383,20 @@ async def handle_agent_event(event: dict):
             pr_url  = outputs.get("pr_url", "")
             repo    = project_repos.get(project_id, "")
             passed  = outputs.get("passed", True)
+            # QA 녹화 영상은 매 라운드 같은 경로(qa_recording.mp4)에 덮어써져서
+            # 앱 안에서는 "이전 라운드 영상"을 볼 방법이 없다 — 라운드마다 실제
+            # 파일을 Jira 이슈에 첨부해서, 링크가 아니라 그 시점 버전 자체가
+            # 영구 보존되게 한다(첨부는 이슈별 독립 저장이라 코멘트 이력처럼
+            # 라운드가 쌓일수록 자연스럽게 히스토리가 된다).
+            video_path = f"/workspace/{project_id}/qa_recording.mp4"
+            video_ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
             for story in stories:
                 if pr_url:
                     await link_pr_to_jira(story, pr_url, repo)
                 icon = "✅" if passed else "⚠️"
                 await add_jira_comment(story, f"{icon} QA {'통과' if passed else '이슈 발견'}: {outputs.get('summary', '')}")
+                if os.path.exists(video_path):
+                    await add_jira_attachment(story, video_path, filename=f"qa_recording_{video_ts}.mp4")
             if stories:
                 await broadcast({
                     "type": "agent_message",
@@ -1451,6 +1472,26 @@ def _safe_design_key(key: str) -> bool:
     return bool(key) and "/" not in key and ".." not in key
 
 
+def _implement_jira_comment_targets(scenario_key: str | None, stories: list[str]) -> list[str]:
+    """구현 완료 코멘트/상태 전환을 어느 Jira 이슈(들)에 적용할지 결정한다 —
+    scenario_key로 범위가 좁혀졌고 실제 존재하는 이슈면 그 이슈 하나만, 아니면
+    (범위 제한 없음 또는 알 수 없는 키) 전체 스토리를 대상으로 한다. 예전엔
+    항상 stories[0] 하나에만 코멘트를 달아서, 두 번째 이후 이슈로 좁혀진
+    재작업의 PR 링크가 (이미 끝난) 첫 번째 이슈에 계속 쌓이는 문제가 있었다."""
+    if scenario_key and scenario_key in stories:
+        return [scenario_key]
+    return stories
+
+
+def _scenarios_with_jira_issue(scenario_keys: list[str], story_keys) -> list[str]:
+    """디자인 목업이 적용될 때 Jira 코멘트를 남길 시나리오만 골라낸다 — Jira
+    연동이 꺼져 있거나 스토리가 없을 때 쓰는 "main" 같은 폴백 키는 실제 이슈가
+    아니므로 코멘트 대상에서 제외해야 한다(안 그러면 add_jira_comment가 존재
+    하지 않는 이슈 키로 계속 실패 호출됨)."""
+    story_set = set(story_keys)
+    return [k for k in scenario_keys if k in story_set]
+
+
 class DesignPublish(BaseModel):
     github_repo: str
     branch: str
@@ -1486,6 +1527,16 @@ async def publish_design(project_id: str, body: DesignPublish):
         os.makedirs(applied_dir, exist_ok=True)
         ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
         applied_count = 0
+        # 목업이 적용될 때마다 그 시나리오(=Jira 이슈 키)에 링크를 코멘트로 남긴다 —
+        # 산출물을 앱 안에서만 보여주면 이 라운드가 최신본으로 덮어써질 때 이전
+        # 버전을 볼 방법이 없어진다(design/applied/{key}.html은 항상 최신 하나뿐).
+        # design/history/{key}/{ts}.html은 이미 서버에 스냅샷으로 남기고 있으니
+        # "최신" 링크와 "이 버전"(스냅샷) 링크를 같이 남겨서, Jira 코멘트 이력
+        # 자체가 그 이슈의 디자인 변경 히스토리 역할을 하게 한다. "main"처럼 Jira
+        # 연동이 꺼져 있을 때 쓰는 폴백 키는 실제 이슈가 아니므로 건너뛴다.
+        commentable = set(_scenarios_with_jira_issue(
+            scenarios, project_jira.get(project_id, {}).get("stories", [])
+        ))
         for key in scenarios:
             src = f"{pending_dir}/{key}.html"
             if not os.path.exists(src):
@@ -1500,6 +1551,12 @@ async def publish_design(project_id: str, body: DesignPublish):
                 f.write(content)
             os.remove(src)
             applied_count += 1
+            if key in commentable:
+                await add_jira_comment(key, (
+                    f"🎨 디자인 목업 반영 (버전 {ts})\n"
+                    f"최신: {PUBLIC_BASE_URL}/design-file/{project_id}/applied/{key}\n"
+                    f"이 버전: {PUBLIC_BASE_URL}/design-file/{project_id}/history/{key}/{ts}"
+                ))
         await broadcast({
             "type": "agent_message", "project_id": project_id, "agent": "system",
             "content": f"🎨 디자인이 머지·적용됐습니다 ({applied_count}개 화면) — 헤더의 🎨 디자인 버튼에서 확인하세요.",
