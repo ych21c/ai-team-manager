@@ -53,11 +53,16 @@ def _cost_usd(model: str, input_tokens: int, output_tokens: int) -> float | None
 # 끝까지 끝난 뒤에야 다음 태스크를 처리하므로(await 지점에서 교차 실행되긴 하지만
 # 이 프로세스는 태스크를 하나씩 순차 처리) 전역 카운터로도 안전 — process_task
 # 시작에서 리셋하고 끝에서 읽는다.
-_token_usage = {"input": 0, "output": 0}
+_token_usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
 
 def _track_usage(resp):
     _token_usage["input"]  += resp.usage.input_tokens
     _token_usage["output"] += resp.usage.output_tokens
+    # verify_scenarios가 PM/Design/목업/규칙을 system 블록으로 캐싱하기 시작한
+    # 뒤로, cache_read가 계속 0이면 캐싱이 실제로 안 걸리고 있다는 신호라
+    # 플로우차트 탭에서 바로 보이게 같이 누적해둔다.
+    _token_usage["cache_read"]  += getattr(resp.usage, "cache_read_input_tokens", 0) or 0
+    _token_usage["cache_write"] += getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
 GCLOUD_KEY_FILE      = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 FIREBASE_TEST_PROJECT = os.getenv("FIREBASE_TEST_PROJECT", "goodenough-test")
 TEST_DEVICE  = os.getenv("TEST_LAB_DEVICE", "model=MediumPhone.arm,version=34,locale=en,orientation=portrait")
@@ -265,6 +270,8 @@ def _finalize_qa_outputs(result: dict, video_ok: bool, manual_count: int,
     if token_usage:
         outputs["input_tokens"]  = token_usage["input"]
         outputs["output_tokens"] = token_usage["output"]
+        outputs["cache_read_tokens"]  = token_usage.get("cache_read", 0)
+        outputs["cache_write_tokens"] = token_usage.get("cache_write", 0)
         cost = _cost_usd(QA_MODEL, token_usage["input"], token_usage["output"])
         if cost is not None:
             outputs["cost_usd"] = cost
@@ -400,6 +407,41 @@ def _list_source_files(workspace: str) -> str:
         result = (
             result[:SOURCE_TOTAL_EXCERPT_LIMIT]
             + "\n... (이하 생략 — 전체 소스가 비정상적으로 커서 잘림, 이 잘림만으로 미구현 판정하지 말 것)"
+        )
+    return result
+
+
+MOCKUP_TOTAL_EXCERPT_LIMIT = 120_000
+
+
+def _list_design_mockups(workspace: str) -> str:
+    """Designer가 만든 실제 HTML 목업(design/applied/*.html — 머지 전이면
+    design/pending/*.html로 폴백) 전체를 모아 LLM 컨텍스트로 만든다. 예전엔
+    시나리오 테스트를 짤 때 design 스테이지의 요약 텍스트(summary)만 줬는데,
+    텍스트 요약은 사람이 다시 압축한 설명이라 버튼 라벨/문구/레이아웃 같은
+    세부사항이 요약 과정에서 빠지기 쉽다 — 실제 목업 HTML을 그대로 주면 그런
+    손실 없이 정확한 문구/구조를 그대로 테스트에 반영할 수 있다. _list_source_files와
+    같은 이유로 파일 단위로는 자르지 않고 전체 합계에만 안전장치를 둔다."""
+    applied_dir = f"{workspace}/design/applied"
+    mockup_dir = applied_dir if os.path.isdir(applied_dir) else f"{workspace}/design/pending"
+    if not os.path.isdir(mockup_dir):
+        return "(디자인 목업 없음 — design/applied, design/pending 둘 다 없음)"
+    lines = []
+    for fname in sorted(os.listdir(mockup_dir)):
+        if not fname.endswith(".html"):
+            continue
+        path = os.path.join(mockup_dir, fname)
+        try:
+            with open(path, errors="replace") as f:
+                content = f.read()
+        except OSError:
+            content = ""
+        lines.append(f"### design/{'applied' if mockup_dir == applied_dir else 'pending'}/{fname}\n{content}")
+    result = "\n\n".join(lines) if lines else "(목업 디렉토리는 있지만 .html 파일이 없음)"
+    if len(result) > MOCKUP_TOTAL_EXCERPT_LIMIT:
+        result = (
+            result[:MOCKUP_TOTAL_EXCERPT_LIMIT]
+            + "\n... (이하 생략 — 전체 목업이 비정상적으로 커서 잘림)"
         )
     return result
 
@@ -543,6 +585,45 @@ def _extract_scenario_test_code(text: str, stop_reason: str | None) -> tuple[str
     return code, None
 
 
+_VERIFY_SCENARIOS_RULES = """당신은 Flutter QA 엔지니어입니다. 이 system 메시지의 다음 블록엔 이
+프로젝트의 PM 요구사항, Designer 스펙, Designer가 실제로 만든 화면 목업(HTML)이 있고, 사용자
+메시지엔 이번 라운드 지시사항 · 이미 통과 확인된 시나리오 목록 · 실제 소스 코드가 있습니다.
+"이번 라운드 지시사항"에 명시된 범위에 대해, 아직 검증 안 된 핵심 시나리오(화면/기능, 사용자
+관점에서 이름 붙일 것) 각각을 실제로 실행해서 확인하는 Flutter 위젯 테스트 파일을 작성하세요.
+전체 PRD를 다 테스트할 필요는 없습니다 — 점진적으로 기능을 늘려가는 워크플로에서 "이번엔
+화면 2개만" 요청했는데 PRD 전체 기준으로 테스트를 쓰면 매번 실패해서 재작업 루프가 끝없이
+돕니다.
+
+규칙:
+- `package:flutter/material.dart`, `package:flutter_test/flutter_test.dart`,
+  `package:integration_test/integration_test.dart`, 그리고 이 프로젝트의 main.dart(정확한
+  패키지 이름은 "이 프로젝트의 Flutter 패키지 이름" 블록 참고)를 반드시 import하세요 —
+  material.dart가 없으면 Scaffold/Column/ElevatedButton 같은 기본 위젯 이름을 못 찾아
+  컴파일이 실패합니다. integration_test는 이 테스트를 로컬 시뮬레이션뿐 아니라 나중에
+  실제 기기(Firebase Test Lab)에서도 그대로 돌리기 위해 반드시 필요합니다.
+- `main()` 함수의 첫 줄은 반드시 `IntegrationTestWidgetsFlutterBinding.ensureInitialized();`
+  여야 합니다 — 이게 없으면 실제 기기에서 실행할 때 테스트가 즉시 실패합니다.
+- 시나리오 하나당 `testWidgets('사용자 관점 시나리오 이름', (tester) async { ... })` 하나.
+- 실제로 `tester.pumpWidget(...)`, `tester.tap(...)`, `tester.pump()`, `expect(...)`로 동작을
+  조작하고 검증하세요 — 클래스가 존재하는지만 확인하는 게 아니라 실제 동작을 확인해야 합니다.
+- 클래스/위젯/아이콘 이름과 화면에 보이는 문구/버튼 라벨은 실제 소스 코드와 Designer 목업
+  HTML에 실제로 있는 것만 쓰세요. 지어내지 마세요 — 목업 HTML이 텍스트 스펙보다 정확한
+  출처이니 문구/라벨은 목업 기준으로 맞추세요.
+- `Center`, `Column`, `Row`, `Padding`, `SizedBox`처럼 MaterialApp/Scaffold 내부에서도
+  흔히 쓰이는 범용 레이아웃 위젯은 화면에 여러 개 있는 게 정상입니다. `find.byType(Center)`
+  같은 걸 `findsOneWidget`으로 검증하지 마세요 — 실제로 프레임워크 내부 위젯까지 겹쳐서
+  개수가 안 맞아 실패하는 게 반복적으로 확인됐습니다. 레이아웃/정렬 확인은 특정 텍스트/버튼이
+  존재하는지(`find.text`, `find.byIcon`, `find.byType(FloatingActionButton)` 등 화면에
+  하나뿐인 구체적 위젯)로 검증하세요.
+- 히스토리/로그/리스트처럼 같은 텍스트가 여러 번 반복될 수 있는 화면(예: 증가를 두 번 눌러서
+  "+1"이 두 번 나타나는 경우)에서는 `find.text('+1')`에 `findsOneWidget`을 쓰지 마세요 —
+  정확히 몇 개인지 셀 수 있으면 `findsNWidgets(n)`을, 몇 개인지 시나리오상 확실치 않으면
+  `findsWidgets`를 쓰세요. `findsOneWidget`은 그 텍스트/위젯이 화면에 정확히 하나만 있어야
+  의미가 있는 경우에만 쓰세요.
+- 전체 목표에는 있지만 이번 라운드 범위 밖인 기능은 테스트하지 마세요.
+- 다른 설명 없이, 파일 전체를 ```dart 코드 블록 하나 안에만 출력하세요."""
+
+
 async def verify_scenarios(project_id: str, workspace: str, context: dict, instruction: str, already_passed: list[str]) -> dict:
     """이번 라운드에 실제로 요청된 범위(instruction)를 코드가 구현하고 있는지
     "실제로 실행해서" 검증한다. 예전엔 LLM이 소스 코드 텍스트를 읽고 "구현된
@@ -555,7 +636,22 @@ async def verify_scenarios(project_id: str, workspace: str, context: dict, instr
     "이번엔 화면 2개만" 요청했는데 PRD 전체(결제/알림 등) 기준으로 테스트를 쓰면
     매번 실패해서 재작업 루프가 끝없이 돈다.
     already_passed(매니페스트에 이미 pass로 기록된 시나리오 제목)는 프롬프트에
-    "재확인 불필요"로만 짧게 넘겨서 토큰을 아낀다."""
+    "재확인 불필요"로만 짧게 넘겨서 토큰을 아낀다.
+
+    PM/Designer 산출물은 예전에 각각 2000자/1500자로 잘라서 넘겼는데, 요약을
+    한 번 더 자르면 뒤쪽 시나리오/세부사항이 통째로 안 보여서 LLM이 실제로
+    구현된 기능도 "명시 안 됐으니 범위 밖"으로 오판할 수 있었다(build_summary가
+    똑같은 이유로 잘림을 없앤 것과 동일한 문제) — 이제 전체를 그대로 넘긴다.
+    Designer 텍스트 스펙 대신/추가로 실제 HTML 목업(_list_design_mockups)도
+    넘긴다 — 텍스트 요약은 사람이 다시 압축한 설명이라 정확한 문구/버튼 라벨이
+    빠지기 쉽지만, 목업 HTML은 그 자체가 원본이라 더 정확하다.
+
+    PM/Designer 산출물·목업·규칙(_VERIFY_SCENARIOS_RULES)은 system 메시지에 넣고
+    캐싱한다 — 규칙은 모든 프로젝트의 모든 QA 라운드에서 완전히 동일한 텍스트라
+    조직 전체에서 캐시가 공유되고, PM/Design/목업은 이 프로젝트 안에서 design이
+    재작업되지 않는 한 라운드가 바뀌어도 그대로라 프로젝트 내 재사용이 된다.
+    매 라운드 실제로 바뀌는 건 소스 코드(구현이 진행되며 계속 바뀜)와
+    instruction/already_passed뿐이라 그건 user 메시지로 뒤에 붙인다."""
     if not ANTHROPIC_API_KEY:
         return {"verdict": "skip", "detail": "ANTHROPIC_API_KEY 없어 시나리오 검증 스킵"}
 
@@ -565,10 +661,11 @@ async def verify_scenarios(project_id: str, workspace: str, context: dict, instr
 
     pm_summary = ""
     if isinstance(context.get("planning"), dict):
-        pm_summary = str(context["planning"].get("summary", ""))[:2000]
+        pm_summary = str(context["planning"].get("summary", ""))
     design_summary = ""
     if isinstance(context.get("design"), dict):
-        design_summary = str(context["design"].get("summary", ""))[:1500]
+        design_summary = str(context["design"].get("summary", ""))
+    mockup_excerpt = _list_design_mockups(workspace)
 
     # _list_source_files가 자체적으로 SOURCE_TOTAL_EXCERPT_LIMIT까지만 담고
     # 그 이상은 명시적으로 표시하므로 여기서 또 잘라낼 필요가 없다 — 예전에
@@ -578,62 +675,44 @@ async def verify_scenarios(project_id: str, workspace: str, context: dict, instr
     already_str = ", ".join(already_passed) if already_passed else "(없음)"
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    prompt = f"""다음은 이번 라운드에 실제로 요청된 작업 범위, PM/Designer 산출물(참고용),
-그리고 Implement가 실제로 만든 Flutter 소스 코드 목록/내용 일부입니다.
+    system_blocks = [
+        {
+            "type": "text",
+            "text": _VERIFY_SCENARIOS_RULES,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        },
+        {
+            "type": "text",
+            "text": f"""## 이 프로젝트의 Flutter 패키지 이름
+{package_name}
 
-## 이번 라운드 지시사항 (검증 기준 — 이 범위만 테스트하세요)
-{instruction[:3000] or "(없음)"}
-
-## PM 요구사항 (참고용 — 지금 이걸 다 테스트할 필요 없음)
+## 이 프로젝트의 PM 요구사항 (전체)
 {pm_summary or "(없음)"}
 
-## Designer 화면/컴포넌트 스펙 (참고용 — 시나리오 이름 붙일 때 참고)
+## 이 프로젝트의 Designer 화면/컴포넌트 스펙 (전체)
 {design_summary or "(없음)"}
+
+## Designer가 실제로 만든 화면 목업 (HTML — 정확한 문구/버튼 라벨/레이아웃은 텍스트
+스펙이 아니라 이 목업 기준으로 판단하세요)
+{mockup_excerpt}""",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        },
+    ]
+    user_prompt = f"""## 이번 라운드 지시사항 (검증 기준 — 이 범위만 테스트하세요)
+{instruction or "(없음)"}
 
 ## 이미 이전 라운드에 통과 확인된 시나리오 (테스트 다시 안 만들어도 됨)
 {already_str}
 
 ## 실제 소스 코드 (lib/ 안 .dart 파일들 — 클래스/위젯 이름은 반드시 여기 있는 그대로 쓰세요)
-{source_excerpt}
-
-**"이번 라운드 지시사항"에 명시된 범위**에 대해, 위에 이미 통과된 것 말고 새로 검증이 필요한
-핵심 시나리오(화면/기능, 사용자 관점에서 이름 붙일 것) 각각을 실제로 실행해서 확인하는
-Flutter 위젯 테스트 파일을 작성하세요.
-
-규칙:
-- `package:flutter/material.dart`, `package:flutter_test/flutter_test.dart`,
-  `package:integration_test/integration_test.dart`, `package:{package_name}/main.dart`
-  네 개를 반드시 import하세요 — material.dart가 없으면 Scaffold/Column/ElevatedButton
-  같은 기본 위젯 이름을 못 찾아 컴파일이 실패합니다. integration_test는 이 테스트를
-  로컬 시뮬레이션뿐 아니라 나중에 실제 기기(Firebase Test Lab)에서도 그대로 돌리기
-  위해 반드시 필요합니다.
-- `main()` 함수의 첫 줄은 반드시 `IntegrationTestWidgetsFlutterBinding.ensureInitialized();`
-  여야 합니다 — 이게 없으면 실제 기기에서 실행할 때 테스트가 즉시 실패합니다.
-- 시나리오 하나당 `testWidgets('사용자 관점 시나리오 이름', (tester) async {{ ... }})` 하나.
-- 실제로 `tester.pumpWidget(...)`, `tester.tap(...)`, `tester.pump()`, `expect(...)`로 동작을
-  조작하고 검증하세요 — 클래스가 존재하는지만 확인하는 게 아니라 실제 동작을 확인해야 합니다.
-- 클래스/위젯/아이콘 이름은 위 소스 코드에 실제로 있는 것만 쓰세요. 지어내지 마세요.
-- `Center`, `Column`, `Row`, `Padding`, `SizedBox`처럼 MaterialApp/Scaffold
-  내부에서도 흔히 쓰이는 범용 레이아웃 위젯은 화면에 여러 개 있는 게 정상입니다.
-  `find.byType(Center)` 같은 걸 `findsOneWidget`으로 검증하지 마세요 — 실제로
-  프레임워크 내부 위젯까지 겹쳐서 개수가 안 맞아 실패하는 게 반복적으로
-  확인됐습니다. 레이아웃/정렬 확인은 특정 텍스트/버튼이 존재하는지(`find.text`,
-  `find.byIcon`, `find.byType(FloatingActionButton)` 등 화면에 하나뿐인 구체적
-  위젯)로 검증하세요.
-- 히스토리/로그/리스트처럼 같은 텍스트가 여러 번 반복될 수 있는 화면(예: 증가를
-  두 번 눌러서 "+1"이 두 번 나타나는 경우)에서는 `find.text('+1')`에
-  `findsOneWidget`을 쓰지 마세요 — 정확히 몇 개인지 셀 수 있으면
-  `findsNWidgets(n)`을, 몇 개인지 시나리오상 확실치 않으면 `findsWidgets`를
-  쓰세요. `findsOneWidget`은 그 텍스트/위젯이 화면에 정확히 하나만 있어야
-  의미가 있는 경우에만 쓰세요.
-- 전체 목표에는 있지만 이번 라운드 범위 밖인 기능은 테스트하지 마세요.
-- 다른 설명 없이, 파일 전체를 ```dart 코드 블록 하나 안에만 출력하세요."""
+{source_excerpt}"""
 
     try:
         resp = client.messages.create(
             model=QA_MODEL,
             max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
+            system=system_blocks,
+            messages=[{"role": "user", "content": user_prompt}],
         )
         _track_usage(resp)
         code, skip_reason = _extract_scenario_test_code(resp.content[0].text, resp.stop_reason)
@@ -758,7 +837,7 @@ Robo 테스트 중 캡처된 스크린샷입니다. 스펙에 명시된 레이�
 스크린샷은 무시하세요.
 
 ## Designer 스펙
-{design_summary[:2000] or "(스펙 없음)"}
+{design_summary or "(스펙 없음)"}
 
 반드시 아래 JSON 형식으로만 답하세요:
 {{"verdict": "match 또는 mismatch 또는 unclear", "detail": "한두 문장으로 일치/불일치 내용"}}"""}]
@@ -821,7 +900,7 @@ def _resolve_target_branch(context: dict) -> str | None:
 
 
 async def process_task(r: aioredis.Redis, task: dict):
-    _token_usage["input"] = _token_usage["output"] = 0
+    _token_usage["input"] = _token_usage["output"] = _token_usage["cache_read"] = _token_usage["cache_write"] = 0
     project_id  = task.get("project_id", "")
     stage       = task.get("stage")
     instruction = task.get("instruction", "")
