@@ -35,6 +35,9 @@ AGENT_NAME   = "qa"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 QA_MODEL = "claude-haiku-4-5-20251001"
+# agents/implement_openhands/run.py의 ARTIFACT_APK_NAME과 반드시 같은 값이어야
+# Implement가 남긴 handoff APK를 QA가 찾을 수 있다.
+IMPLEMENT_ARTIFACT_APK_NAME = "app-debug.apk"
 # USD / 1M 토큰(agents/base/agent.py의 표와 동일 — 모델 바뀌면 같이 갱신).
 _TOKEN_PRICE_PER_MTOK = {QA_MODEL: (1.0, 5.0)}
 
@@ -705,6 +708,26 @@ Robo 테스트 중 캡처된 스크린샷입니다. 스펙에 명시된 레이�
         return {"verdict": "skip", "detail": f"비교 중 에러: {e}"}
 
 
+def _should_reuse_implement_apk(build_cmd: list[str], implement_outputs: dict, apk_exists: bool) -> bool:
+    """Implement(agents/implement_openhands/run.py)가 남긴 handoff APK를 재빌드
+    없이 그대로 쓸지 판단하는 순수 로직만 분리 — QA 자체 빌드(flutter/gradle,
+    Firebase 인증 등 무거운 의존성)까지 실행하지 않고도 이 판단만 단위 테스트할
+    수 있게 한다.
+
+    세 조건을 모두 만족해야 재사용한다:
+    1. qa flavor 같은 특수 빌드 커맨드가 아니라 일반 디버그 빌드일 것 —
+       Implement는 항상 plain `flutter build apk --debug`만 만들기 때문에,
+       특수 커맨드가 필요한 프로젝트는 그 커맨드로 QA가 직접 다시 빌드해야 한다.
+    2. Implement 쪽 빌드가 실제로 성공했을 것(build_ok is True — 값이 아예 없는
+       구버전 세션이나 False인 실패 케이스는 재사용하면 안 됨).
+    3. handoff 파일이 실제로 존재할 것."""
+    return (
+        build_cmd == ["flutter", "build", "apk", "--debug"]
+        and implement_outputs.get("build_ok") is True
+        and apk_exists
+    )
+
+
 def _resolve_target_branch(context: dict) -> str | None:
     """"implement"이 이번 라운드에 실제로 작업한 브랜치의 유일한 권위있는
     출처다. 예전엔 context에 있는 아무 스테이지에서나 "branch" 키를 찾아서
@@ -819,31 +842,48 @@ async def process_task(r: aioredis.Redis, task: dict):
                                     "feedback": rework_reason, "summary": rework_reason}})
         return
 
-    await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
-                    "content": f"🔨 APK 빌드 중... ({' '.join(build_cmd)})"})
+    # Implement(agents/implement_openhands/run.py)가 이미 같은 커맨드로 빌드해서
+    # /workspace/{project_id}-artifacts/에 남겨둔 APK가 있으면 재빌드하지 않고
+    # 그대로 쓴다 — 빌드를 두 번 하지 않을뿐더러, "Implement가 실제로 만든 그
+    # 바이너리"를 QA가 검증한다는 원칙에도 맞는다(QA가 새로 빌드한 별개의
+    # 바이너리를 테스트하는 게 아니라). qa flavor처럼 특수 빌드 커맨드가 필요한
+    # 프로젝트는 Implement의 일반 디버그 빌드로는 안 맞으므로 대상에서 제외한다.
+    # Implement 쪽 빌드가 실패했거나(build_ok=False) 파일이 없으면(재작업 재시도,
+    # 이 기능 도입 전 세션 등) 안전하게 QA 자체 빌드로 폴백한다.
+    implement_outputs = context.get("implement")
+    implement_outputs = implement_outputs if isinstance(implement_outputs, dict) else {}
+    handoff_apk = f"/workspace/{project_id}-artifacts/{IMPLEMENT_ARTIFACT_APK_NAME}"
 
-    _cap_gradle_memory(workspace)
-    run(["flutter", "pub", "get"], cwd=workspace, timeout=180)
-    build = await run_streaming(build_cmd, workspace, 600, r, project_id, "APK 빌드")
-    if build.returncode != 0:
-        error_excerpt = f"{build.stdout[-800:]}\n{build.stderr[-800:]}"
+    if _should_reuse_implement_apk(build_cmd, implement_outputs, os.path.exists(handoff_apk)):
+        apk_path = handoff_apk
         await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
-                        "content": f"❌ APK 빌드 실패:\n{error_excerpt}"})
-        await emit(r, {"type": "stage_completed", "project_id": project_id, "agent": AGENT_NAME, "stage": stage,
-                        "outputs": {"agent": AGENT_NAME, "passed": False, "needs_rework": True,
-                                    "feedback": f"APK 빌드 실패. 이 에러를 고쳐서 다시 구현하세요:\n{error_excerpt[-1000:]}",
-                                    "summary": "APK 빌드 실패"}})
-        return
+                        "content": f"📦 Implement가 빌드한 APK를 그대로 사용합니다 (재빌드 생략): {os.path.basename(apk_path)}"})
+    else:
+        await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                        "content": f"🔨 APK 빌드 중... ({' '.join(build_cmd)})"})
 
-    apk_path = find_apk(workspace)
-    if not apk_path:
-        await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
-                        "content": "❌ 빌드된 APK를 찾지 못했습니다."})
-        await emit(r, {"type": "stage_completed", "project_id": project_id, "agent": AGENT_NAME, "stage": stage,
-                        "outputs": {"agent": AGENT_NAME, "passed": False, "needs_rework": True,
-                                    "feedback": "빌드는 성공했지만 build/app/outputs/flutter-apk/ 안에서 APK 파일을 찾지 못했습니다.",
-                                    "summary": "APK 없음"}})
-        return
+        _cap_gradle_memory(workspace)
+        run(["flutter", "pub", "get"], cwd=workspace, timeout=180)
+        build = await run_streaming(build_cmd, workspace, 600, r, project_id, "APK 빌드")
+        if build.returncode != 0:
+            error_excerpt = f"{build.stdout[-800:]}\n{build.stderr[-800:]}"
+            await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                            "content": f"❌ APK 빌드 실패:\n{error_excerpt}"})
+            await emit(r, {"type": "stage_completed", "project_id": project_id, "agent": AGENT_NAME, "stage": stage,
+                            "outputs": {"agent": AGENT_NAME, "passed": False, "needs_rework": True,
+                                        "feedback": f"APK 빌드 실패. 이 에러를 고쳐서 다시 구현하세요:\n{error_excerpt[-1000:]}",
+                                        "summary": "APK 빌드 실패"}})
+            return
+
+        apk_path = find_apk(workspace)
+        if not apk_path:
+            await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                            "content": "❌ 빌드된 APK를 찾지 못했습니다."})
+            await emit(r, {"type": "stage_completed", "project_id": project_id, "agent": AGENT_NAME, "stage": stage,
+                            "outputs": {"agent": AGENT_NAME, "passed": False, "needs_rework": True,
+                                        "feedback": "빌드는 성공했지만 build/app/outputs/flutter-apk/ 안에서 APK 파일을 찾지 못했습니다.",
+                                        "summary": "APK 없음"}})
+            return
 
     await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
                     "content": f"🐒 Firebase Test Lab에 Robo(무작위) 테스트 제출: {os.path.basename(apk_path)}"})
