@@ -28,6 +28,7 @@ from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.task_tracker import TaskTrackerTool
 from openhands.tools.terminal import TerminalTool
 
+from build_apk import build_and_handoff_apk
 from git_workspace import run, ensure_git_workspace
 from prompt_helpers import mockup_guidance
 
@@ -270,6 +271,18 @@ async def process_task(r: aioredis.Redis, task: dict):
                         "stage": stage, "outputs": {"agent": AGENT_NAME, "summary": "변경사항 없음", **token_usage}})
         return
 
+    # QA가 같은 소스를 처음부터 다시 빌드하지 않도록, Implement가 결정적으로
+    # (LLM 지시가 아니라 이 코드로) 한 번 더 빌드해서 고정 경로에 남긴다.
+    # 실패해도 PR 생성 자체는 막지 않는다 — build_ok=False를 outputs에 실어
+    # 보내면 QA가 이걸 보고 자기 빌드로 폴백한다(process_task의 기존 방어선).
+    build_ok, build_detail, apk_path = await asyncio.to_thread(build_and_handoff_apk, workspace, project_id)
+    if build_ok:
+        await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                        "content": f"📦 APK 빌드 완료 — QA가 재빌드 없이 이 파일을 그대로 검증합니다: {apk_path}"})
+    else:
+        await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                        "content": f"⚠️ 자체 빌드 검증 실패 — QA가 자체 빌드로 폴백해서 검증합니다: {build_detail[:300]}"})
+
     run(["git", "add", "-A"], cwd=workspace)
     run(["git", "commit", "-m", f"AI Implement: {instruction[:60]}"], cwd=workspace)
     push = run(["git", "push", "-u", "origin", branch], cwd=workspace, timeout=120)
@@ -286,7 +299,8 @@ async def process_task(r: aioredis.Redis, task: dict):
                         "content": f"⚠️ 브랜치는 push했지만 PR 생성에 실패했습니다: {branch}"})
         await emit(r, {"type": "stage_completed", "project_id": project_id, "agent": AGENT_NAME,
                         "stage": stage, "outputs": {"agent": AGENT_NAME, "summary": "PR 생성 실패",
-                                                     "branch": branch, "head_sha": head_sha, **token_usage}})
+                                                     "branch": branch, "head_sha": head_sha,
+                                                     "build_ok": build_ok, **token_usage}})
         return
 
     await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
@@ -300,6 +314,7 @@ async def process_task(r: aioredis.Redis, task: dict):
             "pr_number": pr["number"],
             "pr_url": pr["html_url"],
             "head_sha": head_sha,
+            "build_ok": build_ok,
             **token_usage,
         },
     })
