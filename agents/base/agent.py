@@ -304,7 +304,14 @@ async def process_chat_triage(r: aioredis.Redis, task: dict):
         async with client.messages.stream(
             model=AGENT_MODELS.get("pm", MODEL),
             max_tokens=_SONNET_MAX,
-            system=CHAT_TRIAGE_PROMPT,
+            # CHAT_TRIAGE_PROMPT는 모든 프로젝트의 모든 chat_triage 호출에서 완전히
+            # 동일한 텍스트다 — 1시간 TTL로 캐싱해서 반복 호출마다 정가로 다시
+            # 처리되지 않게 한다.
+            system=[{
+                "type": "text",
+                "text": CHAT_TRIAGE_PROMPT,
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            }],
             messages=[{"role": "user", "content": user_prompt}],
         ) as stream:
             async for chunk in stream.text_stream:
@@ -454,22 +461,39 @@ async def process_task(r: aioredis.Redis, task: dict):
 
     client = anthropic.AsyncAnthropic(api_key=API_KEY)
     full_response = ""
-    conv_messages = [{"role": "user", "content": user_prompt}]
+    # 첫 user 턴에 캐시 브레이크포인트를 둔다 — max_tokens에 걸려 continuation을
+    # 보낼 때마다(아래) 이 turn을 그대로 다시 포함시키는데, 마커가 없으면 매번
+    # 정가로 재처리된다. system 프롬프트(get_system_prompt)까지 포함해서 캐싱되므로
+    # 이 프로젝트/스테이지의 재시도 라운드가 늘어날수록 절감 폭도 커진다.
+    conv_messages = [{"role": "user", "content": [
+        {"type": "text", "text": user_prompt, "cache_control": {"type": "ephemeral"}},
+    ]}]
     # max_tokens continuation(재시도)이 여러 번 일어날 수 있어 이번 스테이지 실행
     # 전체의 토큰을 합산한다 — 마지막 시도분만 남기면 실제 쓴 비용보다 적게 보임.
     total_input_tokens = 0
     total_output_tokens = 0
+    total_cache_read_tokens = 0
+    total_cache_write_tokens = 0
 
     # MAX_TOKENS를 모델의 절대 상한까지 올려놔도, 이론적으로는 그 상한 자체에
     # 걸려서 잘릴 수 있다 — 그 경우 조용히 잘린 채로 끝내지 않고, 지금까지 쓴
     # 내용을 assistant 턴으로, "이어서 계속 작성해달라"를 새 user 턴으로 넣어
     # 후속 요청을 보낸다(trailing assistant prefill이 아니라 정상적인 멀티턴
     # 대화라 4.6 계열 모델에서도 문제없이 동작). MAX_CONTINUATIONS번까지 반복.
+    # get_system_prompt(project_id)는 self-improve 모드가 아닌 한 이 역할(AGENT_NAME)에
+    # 대해 항상 완전히 동일한 텍스트다 — 같은 프로젝트 안에서의 재시도는 물론, 서로
+    # 다른 프로젝트의 같은 역할 컨테이너끼리도 Anthropic 서버 캐시를 공유하므로
+    # 1시간 TTL로 캐싱해서 반복 호출의 input 토큰 비용을 크게 줄인다.
+    system_blocks = [{
+        "type": "text",
+        "text": get_system_prompt(project_id),
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }]
     for attempt in range(MAX_CONTINUATIONS + 1):
         async with client.messages.stream(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=get_system_prompt(project_id),
+            system=system_blocks,
             messages=conv_messages,
         ) as stream:
             async for chunk in stream.text_stream:
@@ -486,14 +510,19 @@ async def process_task(r: aioredis.Redis, task: dict):
 
         total_input_tokens  += final_message.usage.input_tokens
         total_output_tokens += final_message.usage.output_tokens
+        total_cache_read_tokens  += getattr(final_message.usage, "cache_read_input_tokens", 0) or 0
+        total_cache_write_tokens += getattr(final_message.usage, "cache_creation_input_tokens", 0) or 0
 
         if final_message.stop_reason != "max_tokens":
             break
         if attempt == MAX_CONTINUATIONS:
             print(f"[{AGENT_NAME}] max_tokens continuation 한도({MAX_CONTINUATIONS}회) 도달 — 여기서 중단")
             break
+        # 첫 user 턴은 바이트 단위로 그대로 유지해야 위에서 캐싱한 프리픽스가
+        # 무효화되지 않는다 — 문자열이 아니라 cache_control 마커가 붙은 동일한
+        # content 블록을 재사용한다.
         conv_messages = [
-            {"role": "user", "content": user_prompt},
+            conv_messages[0],
             {"role": "assistant", "content": full_response},
             {"role": "user", "content": (
                 "방금 응답이 max_tokens 한도에 걸려 중간에 끊겼습니다. "
@@ -556,6 +585,10 @@ async def process_task(r: aioredis.Redis, task: dict):
         "self_improve": project_id == "self-improve",
         "input_tokens":  total_input_tokens,
         "output_tokens": total_output_tokens,
+        # 캐싱이 실제로 걸리는지 확인용 — cache_read가 계속 0이면 프롬프트 캐싱이
+        # 무효화되고 있다는 신호(prefix가 매번 바뀜 등)이니 여기서 바로 보임.
+        "cache_read_tokens":  total_cache_read_tokens,
+        "cache_write_tokens": total_cache_write_tokens,
     }
     cost = _cost_usd(MODEL, total_input_tokens, total_output_tokens)
     if cost is not None:
