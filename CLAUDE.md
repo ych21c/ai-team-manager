@@ -32,6 +32,17 @@
   컨슈머 그룹 unack 재전달을 지원하고, 프로젝트 상태는 `STATE_DIR`에
   JSON으로 영속화돼 재시작해도 복원됨).
 
+## 배포 러너(scripts/deploy_runner.py)는 Docker가 아니라 호스트에서 뜬다
+
+스프린트 최하단 "배포" 버튼(`orchestrator/main.py`의 `POST
+/projects/{id}/deploy`)이 트리거하는 실제 `flutter build`/`fastlane` 업로드는
+Xcode가 필요해서 orchestrator의 Linux Docker 컨테이너 안에서는 못 돈다.
+`scripts/deploy_runner.py`(표준 라이브러리만 씀, 호스트 python3.9로 바로 실행
+가능)를 이 Mac 호스트에서 `python3 scripts/deploy_runner.py`로 직접 띄워야
+배포 버튼이 동작한다 — orchestrator 컨테이너를 재빌드/재시작해도 이 프로세스는
+안 딸려온다는 뜻이므로, 배포 관련 코드를 고치면 이 프로세스도 별도로
+재시작해야 반영된다.
+
 # Docker 빌드 관련 이슈
 
 이 환경에서 `docker build`(BuildKit)가 키체인 접근 문제로 실패할 수 있다

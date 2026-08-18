@@ -26,6 +26,15 @@ interface JiraInfo {
   epic?: string; stories?: string[]; confluence_url?: string; jira_url?: string;
 }
 interface TokenTotals { input_tokens: number; output_tokens: number; cost_usd: number; }
+interface DeployConfig {
+  app_name?: string; app_identifier?: string; language?: string; app_version?: string;
+  environment?: "test" | "dev" | "prod"; platforms?: string[]; host_workspace_path?: string;
+}
+interface DeployStatus {
+  status: "idle" | "running" | "success" | "failed";
+  started_at?: number; finished_at?: number;
+  app_version?: string; build_number?: string; log_tail?: string; error?: string;
+}
 interface Project {
   id: string; name: string; repo?: string;
   stages?: Record<string, StageInfo>;
@@ -33,6 +42,8 @@ interface Project {
   token_totals?: TokenTotals;
   instruction?: string;
   sprint?: number;
+  deploy_config?: DeployConfig;
+  deploy_status?: DeployStatus;
 }
 interface ApprovalRequest {
   project_id: string; stage: string; message: string;
@@ -863,6 +874,184 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
           </div>
         );
       })}
+
+      <DeployPanel
+        projectId={projectId}
+        config={project?.deploy_config}
+        status={project?.deploy_status}
+        releaseCompleted={stages?.release?.status === "completed"}
+      />
+    </div>
+  );
+}
+
+// ── 배포 카드 (스프린트 최하단) ──────────────────────────────────────
+// Release 완료 후, 실제 앱스토어 빌드+업로드를 트리거하는 카드. 빌드 자체는
+// Xcode가 필요해 이 웹/오케스트레이터가 도는 Docker 컨테이너 안에서는 못 돌고,
+// 호스트에서 네이티브로 도는 scripts/deploy_runner.py가 대신 실행한다 —
+// 자세한 흐름은 orchestrator/main.py의 POST /projects/{id}/deploy 참고.
+const DEPLOY_FIELDS: { key: keyof DeployConfig; label: string; placeholder: string }[] = [
+  { key: "app_name",       label: "App Name",       placeholder: "예: GoodEnough" },
+  { key: "app_identifier", label: "App Identifier", placeholder: "예: com.myownchild.goodenough" },
+  { key: "language",       label: "Language",       placeholder: "예: ko" },
+  { key: "app_version",    label: "App Version",    placeholder: "예: 1.0.1" },
+  { key: "host_workspace_path", label: "호스트 워크스페이스 경로", placeholder: "예: /Volumes/External/Dev/Development/child-care-medication" },
+];
+
+function DeployPanel({ projectId, config, status, releaseCompleted }: {
+  projectId: string; config: DeployConfig | undefined; status: DeployStatus | undefined; releaseCompleted: boolean;
+}) {
+  const [editingField, setEditingField] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [logOpen, setLogOpen] = useState(false);
+
+  const cfg = config ?? {};
+  const st  = status ?? { status: "idle" as const };
+  const platforms = cfg.platforms ?? ["ios", "android"];
+  const environment = cfg.environment ?? "prod";
+
+  const saveConfig = async (patch: Partial<DeployConfig>) => {
+    setBusy(true);
+    setNotice("");
+    try {
+      const r = await fetch(`${API_URL}/projects/${projectId}/deploy/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (!r.ok) throw new Error(await r.text().catch(() => "저장 실패"));
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : "저장 실패");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const startEdit = (key: string, current?: string) => { setEditingField(key); setDraft(current ?? ""); };
+  const commitEdit = (key: string) => { setEditingField(null); void saveConfig({ [key]: draft }); };
+
+  const triggerDeploy = async () => {
+    setBusy(true);
+    setNotice("");
+    try {
+      const r = await fetch(`${API_URL}/projects/${projectId}/deploy`, { method: "POST" });
+      if (!r.ok) throw new Error(await r.text().catch(() => "배포 시작 실패"));
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : "배포 시작 실패");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disabled = !releaseCompleted || st.status === "running";
+
+  return (
+    <div style={{
+      marginTop: 14, padding: "14px 16px", borderRadius: 10,
+      border: "0.5px solid #e5e5e5", background: releaseCompleted ? "#fff" : "#FAFAF8",
+      opacity: releaseCompleted ? 1 : 0.6,
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <div style={{ fontSize: 13, fontWeight: 500, color: "#333" }}>🚀 배포</div>
+        {!releaseCompleted && <div style={{ fontSize: 11, color: "#aaa" }}>Release 완료 후 배포 가능</div>}
+      </div>
+
+      {notice && (
+        <div style={{ fontSize: 12, color: "#A32D2D", background: "#FCEBEB", border: "0.5px solid #F0C6C6", borderRadius: 6, padding: "6px 10px", marginBottom: 10 }}>
+          {notice}
+        </div>
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+        {DEPLOY_FIELDS.map(({ key, label, placeholder }) => {
+          const value = (cfg[key] as string | undefined) ?? "";
+          const isEditing = editingField === key;
+          return (
+            <div key={key} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+              <div style={{ width: 150, flexShrink: 0, color: "#888" }}>{label}</div>
+              {isEditing ? (
+                <>
+                  <input
+                    autoFocus value={draft} placeholder={placeholder}
+                    onChange={e => setDraft(e.target.value)}
+                    onKeyDown={e => { if (e.key === "Enter") commitEdit(key); if (e.key === "Escape") setEditingField(null); }}
+                    style={{ flex: 1, padding: "4px 8px", fontSize: 12, border: "0.5px solid #d5d5d5", borderRadius: 6, outline: "none" }}
+                  />
+                  <button onClick={() => commitEdit(key)} style={{ fontSize: 11, padding: "3px 8px", borderRadius: 5, border: "none", background: "#7F77DD", color: "#fff", cursor: "pointer" }}>저장</button>
+                </>
+              ) : (
+                <>
+                  <div style={{ flex: 1, color: value ? "#333" : "#bbb" }}>{value || "미설정"}</div>
+                  <button onClick={() => startEdit(key, value)} title="수정" style={{ fontSize: 11, padding: "2px 6px", borderRadius: 5, border: "0.5px solid #e5e5e5", background: "#f7f7f5", color: "#888", cursor: "pointer" }}>✎</button>
+                </>
+              )}
+            </div>
+          );
+        })}
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+          <div style={{ width: 150, flexShrink: 0, color: "#888" }}>Environment</div>
+          <select value={environment} onChange={e => void saveConfig({ environment: e.target.value as DeployConfig["environment"] })}
+            style={{ fontSize: 12, padding: "4px 8px", border: "0.5px solid #d5d5d5", borderRadius: 6 }}>
+            <option value="test">test</option>
+            <option value="dev">dev</option>
+            <option value="prod">prod</option>
+          </select>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+          <div style={{ width: 150, flexShrink: 0, color: "#888" }}>Platforms</div>
+          {(["ios", "android"] as const).map(p => (
+            <label key={p} style={{ display: "flex", alignItems: "center", gap: 4, color: "#555" }}>
+              <input type="checkbox" checked={platforms.includes(p)}
+                onChange={e => {
+                  const next = e.target.checked ? [...platforms, p] : platforms.filter(x => x !== p);
+                  void saveConfig({ platforms: next.length ? next : platforms });
+                }}
+              /> {p}
+            </label>
+          ))}
+        </div>
+
+        {st.build_number && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+            <div style={{ width: 150, flexShrink: 0, color: "#888" }}>마지막 빌드번호</div>
+            <div style={{ color: "#333" }}>{st.build_number} (자동 증가, 편집 불가)</div>
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <button onClick={triggerDeploy} disabled={disabled || busy}
+          style={{
+            padding: "8px 16px", borderRadius: 8, border: "none", fontSize: 12.5, fontWeight: 500,
+            background: disabled || busy ? "#e5e5e5" : "#0F6E56", color: disabled || busy ? "#999" : "#fff",
+            cursor: disabled || busy ? "not-allowed" : "pointer",
+          }}>
+          {st.status === "running" ? "배포 중…" : "배포"}
+        </button>
+        {st.status === "success" && (
+          <div style={{ fontSize: 12, color: "#3B6D11" }}>✅ {st.app_version}+{st.build_number} 배포 완료</div>
+        )}
+        {st.status === "failed" && (
+          <>
+            <div style={{ fontSize: 12, color: "#A32D2D" }}>❌ {st.error || "배포 실패"}</div>
+            {st.log_tail && (
+              <button onClick={() => setLogOpen(v => !v)} style={{ fontSize: 11, color: "#888", background: "none", border: "none", cursor: "pointer", textDecoration: "underline" }}>
+                {logOpen ? "로그 숨기기" : "로그 보기"}
+              </button>
+            )}
+          </>
+        )}
+      </div>
+
+      {logOpen && st.log_tail && (
+        <pre style={{ marginTop: 10, maxHeight: 240, overflow: "auto", fontSize: 11, background: "#1E1E1E", color: "#ddd", padding: 10, borderRadius: 6, whiteSpace: "pre-wrap" }}>
+          {st.log_tail}
+        </pre>
+      )}
     </div>
   );
 }
