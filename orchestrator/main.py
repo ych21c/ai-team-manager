@@ -62,6 +62,21 @@ MAX_STORED_MESSAGES = 300   # 프로젝트당 메모리 상한
 # Run으로 재실행하면 merge 시 덮어써진다(pipeline.py mark_completed) — 게이트 노드
 # 배지는 "이번 실행", 탭 헤더 합계는 이 누적치를 쓴다.
 project_token_totals: dict[str, dict] = {}
+# project_id → { app_name, app_identifier, language, app_version, environment,
+# platforms: ["ios","android"], host_workspace_path } — 스프린트 화면 배포 카드에서
+# 사람이 웹으로 편집하는 값들. App Store Connect/Google Play 자격증명은 여기 안
+# 들어간다 — host_workspace_path가 가리키는 프로젝트 레포 자신의 fastlane/.env가
+# 이미 그걸 갖고 있고 deploy_runner가 그 디렉토리에서 fastlane을 그대로 실행하므로
+# ai-dev-team은 자격증명을 아예 저장·전송하지 않는다.
+project_deploy_config: dict[str, dict] = {}
+# project_id → { status: idle|running|success|failed, started_at, finished_at,
+# build_number, log_tail, error } — 배포 1회 실행 결과. build_number는 사람이
+# 편집 못 하는 자동 증가값이라 여기 결과로만 보여준다.
+project_deploy_status: dict[str, dict] = {}
+# 빌드(Xcode 필요)는 orchestrator의 Linux Docker 컨테이너 안에서 못 돌려서, 이
+# Mac 호스트에서 네이티브로 도는 scripts/deploy_runner.py를 호출한다.
+# host.docker.internal은 Docker Desktop for Mac이 기본 제공하는 호스트 DNS.
+DEPLOY_RUNNER_URL = os.getenv("DEPLOY_RUNNER_URL", "http://host.docker.internal:8765")
 qa_retry_counts: dict[str, int] = {}   # project_id → QA/AutoTest가 Implement에 재작업 요청한 횟수 (합산)
 MAX_QA_RETRIES = 3   # 이 횟수를 넘으면 재시도 없이 실패 처리하고 파이프라인을 멈춤 (무한루프 방지)
 chat_triage_in_flight: dict[str, float] = {}   # project_id → PM triage 태스크를 보낸 시각
@@ -209,6 +224,10 @@ def _load_all_projects():
             project_docs[pid] = data["doc"]
         if data.get("token_totals"):
             project_token_totals[pid] = data["token_totals"]
+        if data.get("deploy_config"):
+            project_deploy_config[pid] = data["deploy_config"]
+        if data.get("deploy_status"):
+            project_deploy_status[pid] = data["deploy_status"]
         print(f"[state] 복원됨: {pid} ({project_names[pid]})")
 
 
@@ -1217,6 +1236,8 @@ def _make_project_info(pid: str) -> dict:
         "messages": project_messages.get(pid, []),
         "jira":     project_jira.get(pid, {}),
         "token_totals": project_token_totals.get(pid, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}),
+        "deploy_config": project_deploy_config.get(pid, {}),
+        "deploy_status": project_deploy_status.get(pid, {"status": "idle"}),
     }
 
 
@@ -1825,6 +1846,142 @@ async def discard_stage(project_id: str, stage_name: str):
         "type": "project_updated", "project_id": project_id,
         "projects": {project_id: _make_project_info(project_id)},
     })
+    return {"ok": True}
+
+
+class DeployConfigUpdate(BaseModel):
+    app_name: str | None = None
+    app_identifier: str | None = None
+    language: str | None = None
+    app_version: str | None = None
+    environment: str | None = None       # test|dev|prod
+    platforms: list[str] | None = None   # ["ios","android"] 부분집합
+    host_workspace_path: str | None = None
+
+_DEPLOY_ENVIRONMENTS = {"test", "dev", "prod"}
+_DEPLOY_PLATFORMS = {"ios", "android"}
+
+@app.put("/projects/{project_id}/deploy/config")
+async def update_deploy_config(project_id: str, body: DeployConfigUpdate):
+    """스프린트 화면 맨 아래 배포 카드의 필드 편집. App Store Connect/Google Play
+    자격증명은 여기 안 들어간다 — host_workspace_path가 가리키는 프로젝트 레포
+    자신의 fastlane/.env가 이미 갖고 있고 deploy_runner가 그 디렉토리에서
+    fastlane을 그대로 실행하므로 ai-dev-team은 자격증명을 저장·전송하지 않는다.
+    넘어온 필드만 덮어쓰는 부분 업데이트."""
+    if project_id not in projects:
+        raise HTTPException(404)
+    if body.environment is not None and body.environment not in _DEPLOY_ENVIRONMENTS:
+        raise HTTPException(400, f"environment는 {sorted(_DEPLOY_ENVIRONMENTS)} 중 하나여야 합니다")
+    if body.platforms is not None:
+        invalid = set(body.platforms) - _DEPLOY_PLATFORMS
+        if invalid or not body.platforms:
+            raise HTTPException(400, f"platforms는 {sorted(_DEPLOY_PLATFORMS)}의 비어있지 않은 부분집합이어야 합니다")
+
+    cfg = project_deploy_config.setdefault(project_id, {})
+    cfg.update(body.model_dump(exclude_unset=True))
+    _save_project(project_id)
+    await broadcast({
+        "type": "project_updated", "project_id": project_id,
+        "projects": {project_id: _make_project_info(project_id)},
+    })
+    return {"ok": True, "deploy_config": cfg}
+
+
+@app.post("/projects/{project_id}/deploy")
+async def trigger_deploy(project_id: str):
+    """스프린트 최하단 배포 버튼 — Release 스테이지가 끝난 뒤에만 허용된다. 실제
+    빌드(flutter build ipa/appbundle)는 Xcode가 필요해 orchestrator가 도는 Linux
+    Docker 컨테이너 안에서는 못 돌리므로, 이 Mac 호스트에서 네이티브로 도는
+    scripts/deploy_runner.py를 호출만 하고 바로 리턴한다(빌드가 몇 분~수십 분
+    걸림). 실제 결과는 /internal/deploy-callback으로 비동기 통보된다."""
+    p = projects.get(project_id)
+    if not p:
+        raise HTTPException(404)
+
+    release = p.stages.get("release")
+    if not release or release.status != StageStatus.COMPLETED:
+        raise HTTPException(409, "Release 스테이지가 완료된 뒤에만 배포할 수 있습니다")
+
+    if project_deploy_status.get(project_id, {}).get("status") == "running":
+        raise HTTPException(409, "이미 배포가 진행 중입니다")
+
+    cfg = project_deploy_config.get(project_id, {})
+    workspace = cfg.get("host_workspace_path")
+    if not workspace:
+        raise HTTPException(400, "host_workspace_path가 설정돼 있지 않습니다 — 배포 카드에서 먼저 설정하세요")
+
+    project_deploy_status[project_id] = {"status": "running", "started_at": int(time.time() * 1000)}
+    _save_project(project_id)
+    await broadcast({
+        "type": "project_updated", "project_id": project_id,
+        "projects": {project_id: _make_project_info(project_id)},
+    })
+
+    payload = {
+        "project_id": project_id,
+        "workspace": workspace,
+        "environment": cfg.get("environment", "prod"),
+        "platforms": cfg.get("platforms", ["ios", "android"]),
+        "app_version": cfg.get("app_version"),
+        "callback_url": "http://localhost:8000/internal/deploy-callback",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(f"{DEPLOY_RUNNER_URL}/run", json=payload)
+            r.raise_for_status()
+    except Exception as e:
+        started_at = project_deploy_status[project_id]["started_at"]
+        error = (f"배포 러너({DEPLOY_RUNNER_URL})에 연결할 수 없습니다 — 호스트에서 "
+                 f"scripts/deploy_runner.py가 실행 중인지 확인하세요. ({e})")
+        project_deploy_status[project_id] = {
+            "status": "failed", "started_at": started_at,
+            "finished_at": int(time.time() * 1000), "error": error,
+        }
+        _save_project(project_id)
+        await broadcast({
+            "type": "project_updated", "project_id": project_id,
+            "projects": {project_id: _make_project_info(project_id)},
+        })
+        raise HTTPException(502, error)
+
+    await _add_history(project_id, f"🚀 배포 시작 (env={payload['environment']}, version={payload['app_version']})")
+    return {"ok": True}
+
+
+class DeployCallback(BaseModel):
+    project_id: str
+    success: bool
+    app_version: str | None = None
+    build_number: str | None = None
+    log_tail: str = ""
+    error: str | None = None
+
+@app.post("/internal/deploy-callback")
+async def deploy_callback(body: DeployCallback):
+    """호스트에서 도는 deploy_runner.py가 빌드+업로드를 끝낸 뒤 결과를 통보하는
+    내부 콜백. 외부에 노출되지 않는 경로라 별도 인증 없음(오케스트레이터 8000
+    포트 자체가 지금도 무인증인 것과 동일한 보안 수준)."""
+    project_id = body.project_id
+    if project_id not in projects:
+        raise HTTPException(404)
+
+    prev = project_deploy_status.get(project_id, {})
+    project_deploy_status[project_id] = {
+        "status": "success" if body.success else "failed",
+        "started_at": prev.get("started_at"),
+        "finished_at": int(time.time() * 1000),
+        "app_version": body.app_version,
+        "build_number": body.build_number,
+        "log_tail": body.log_tail,
+        "error": body.error,
+    }
+    _save_project(project_id)
+    await broadcast({
+        "type": "project_updated", "project_id": project_id,
+        "projects": {project_id: _make_project_info(project_id)},
+    })
+    label = f"{body.app_version}+{body.build_number}" if body.success else (body.error or "실패")
+    await _add_history(project_id, f"{'✅' if body.success else '❌'} 배포 {'완료' if body.success else '실패'}: {label}")
     return {"ok": True}
 
 
