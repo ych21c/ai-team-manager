@@ -32,6 +32,7 @@ interface Project {
   jira?: JiraInfo;
   token_totals?: TokenTotals;
   instruction?: string;
+  sprint?: number;
 }
 interface ApprovalRequest {
   project_id: string; stage: string; message: string;
@@ -778,7 +779,15 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: "16px 20px", display: "flex", flexDirection: "column", gap: 4 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-        <div style={{ fontSize: 11, color: "#aaa" }}>PM → Design → Implement → QA → AutoTest → Release</div>
+        <div style={{ fontSize: 11, color: "#aaa", display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{
+            fontSize: 10.5, fontWeight: 500, color: "#7F77DD", background: "#EEEDFE",
+            border: "0.5px solid #DAD6F5", borderRadius: 5, padding: "1px 7px",
+          }} title="planning부터 전체를 다시 돌린(재기획) 횟수">
+            Sprint {project?.sprint ?? 1}
+          </span>
+          <span>PM → Design → Implement → QA → AutoTest → Release</span>
+        </div>
         <div style={{ fontSize: 11, color: "#aaa" }}>
           누적: 🔤 {totals?.input_tokens ?? 0} in · {totals?.output_tokens ?? 0} out
           {totals?.cost_usd ? ` · $${totals.cost_usd.toFixed(4)}` : ""}
@@ -1161,7 +1170,7 @@ export default function Home() {
     if (type === "init") {
       const raw = event.projects as Record<string, Project & { messages?: Message[] }>;
       if (raw) {
-        const list = Object.entries(raw).map(([id, v]) => ({ id, name: v.name ?? id, repo: v.repo, stages: v.stages, jira: v.jira }));
+        const list = Object.entries(raw).map(([id, v]) => ({ id, name: v.name ?? id, repo: v.repo, stages: v.stages, jira: v.jira, sprint: v.sprint }));
         setProjects(list);
         // approval_required는 단발성 이벤트라 그 순간 연결이 안 돼 있었으면
         // 놓친다 — 서버 상태(stages[].status)를 기준으로 승인 목록을 다시 맞춘다.
@@ -1177,7 +1186,7 @@ export default function Home() {
     else if (type === "project_added" || type === "project_updated") {
       const raw = event.projects as Record<string, Project>;
       if (raw) {
-        const list = Object.entries(raw).map(([id, v]) => ({ id, name: v.name ?? id, repo: v.repo, stages: v.stages, jira: v.jira }));
+        const list = Object.entries(raw).map(([id, v]) => ({ id, name: v.name ?? id, repo: v.repo, stages: v.stages, jira: v.jira, sprint: v.sprint }));
         setProjects(list);
         // 여기서도 마찬가지로 서버 상태 기준으로 승인 목록을 다시 맞춘다 — design
         // 재작업 등으로 stage가 waiting_approval로 바뀌었는데 그 사이 WS가
