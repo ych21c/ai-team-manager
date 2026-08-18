@@ -1390,7 +1390,10 @@ export default function Home() {
     if (type === "init") {
       const raw = event.projects as Record<string, Project & { messages?: Message[] }>;
       if (raw) {
-        const list = Object.entries(raw).map(([id, v]) => ({ id, name: v.name ?? id, repo: v.repo, stages: v.stages, jira: v.jira, sprint: v.sprint }));
+        const list = Object.entries(raw).map(([id, v]) => ({
+          id, name: v.name ?? id, repo: v.repo, stages: v.stages, jira: v.jira, sprint: v.sprint,
+          deploy_config: v.deploy_config, deploy_status: v.deploy_status,
+        }));
         setProjects(list);
         // approval_required는 단발성 이벤트라 그 순간 연결이 안 돼 있었으면
         // 놓친다 — 서버 상태(stages[].status)를 기준으로 승인 목록을 다시 맞춘다.
@@ -1406,8 +1409,23 @@ export default function Home() {
     else if (type === "project_added" || type === "project_updated") {
       const raw = event.projects as Record<string, Project>;
       if (raw) {
-        const list = Object.entries(raw).map(([id, v]) => ({ id, name: v.name ?? id, repo: v.repo, stages: v.stages, jira: v.jira, sprint: v.sprint }));
-        setProjects(list);
+        const updates = Object.entries(raw).map(([id, v]) => ({
+          id, name: v.name ?? id, repo: v.repo, stages: v.stages, jira: v.jira, sprint: v.sprint,
+          deploy_config: v.deploy_config, deploy_status: v.deploy_status,
+        }));
+        // project_updated는 바뀐 프로젝트 하나만 실어 보낸다(discard/approve/deploy
+        // 등 대부분의 엔드포인트가 그렇게 브로드캐스트함) — 예전엔 여기서 setProjects를
+        // raw 그대로 통째로 교체해버려서, 다른 프로젝트를 사이드바/승인 목록에서
+        // 순간적으로 지워버리는 버그가 있었다(배포 카드 저장을 테스트하다 실제로
+        // 재현: 프로젝트 3개 중 1개만 저장했는데 사이드바에 1개만 남음). prev와
+        // merge해서 언급 안 된 프로젝트는 그대로 둔다.
+        let list: Project[] = [];
+        setProjects(prev => {
+          const byId = new Map(prev.map(p => [p.id, p]));
+          updates.forEach(u => byId.set(u.id, { ...byId.get(u.id), ...u }));
+          list = Array.from(byId.values());
+          return list;
+        });
         // 여기서도 마찬가지로 서버 상태 기준으로 승인 목록을 다시 맞춘다 — design
         // 재작업 등으로 stage가 waiting_approval로 바뀌었는데 그 사이 WS가
         // 끊겼다 재연결됐으면 approval_required 이벤트를 못 받을 수 있다.
