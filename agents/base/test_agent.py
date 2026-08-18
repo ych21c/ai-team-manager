@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("ANTHROPIC_API_KEY", "")
 
 from agent import (
+    ROLE_PROMPTS,
     build_summary,
     extract_design_map,
     parse_scenario_mockups,
@@ -214,3 +215,16 @@ def test_garbage_target_value_falls_back_to_none_string_not_raises():
     text = '{"scope": "design", "target": 123, "feedback": "x", "reply": "y"}'
     result = parse_triage_decision(text)
     assert result["target"] == "123"
+
+
+# ── PM 프롬프트가 디자인 디테일을 침범하지 않는지 ────────────────────
+# 회귀 테스트 — PM이 requirements에 컬러/패딩 같은 시각 디자인 디테일까지
+# 구체적으로 지시해서 designer의 재량을 침범하던 문제. requirements는
+# 기능/수용 기준 중심으로만 쓰고, 시각 디테일은 designer 몫으로 남기라는
+# 제약을 프롬프트에 명시했다.
+
+def test_pm_prompt_excludes_visual_design_details():
+    pm_prompt = ROLE_PROMPTS["pm"]
+    assert "컬러" in pm_prompt
+    assert "패딩" in pm_prompt
+    assert "designer" in pm_prompt
