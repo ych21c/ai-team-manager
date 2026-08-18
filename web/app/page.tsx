@@ -112,6 +112,62 @@ const headerLinkStyle: CSSProperties = {
   border: "0.5px solid #e5e5e5", padding: "4px 10px", borderRadius: 6, whiteSpace: "nowrap",
 };
 
+// Jira / Confluence / GitHub 링크를 흩어놓지 않고 버튼 하나(드롭다운)로 모아 보여준다.
+// 프로젝트에 연결된 링크만 골라 보여주고, 하나도 없으면 버튼 자체를 숨긴다.
+function ProjectLinksMenu({ project, variant = "header" }: { project?: Project; variant?: "header" | "mobile" | "compact" }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, [open]);
+
+  const links = [
+    project?.jira?.jira_url && { label: "Jira", icon: "📋", url: project.jira.jira_url },
+    project?.jira?.confluence_url && { label: "Confluence", icon: "📄", url: project.jira.confluence_url },
+    project?.repo && { label: "GitHub", icon: "🔗", url: `https://github.com/${project.repo}` },
+  ].filter(Boolean) as { label: string; icon: string; url: string }[];
+
+  if (links.length === 0) return null;
+
+  const buttonStyle: CSSProperties =
+    variant === "compact"
+      ? { background: "none", border: "none", color: "#bbb", fontSize: 12, lineHeight: 1, padding: 0, cursor: "pointer", display: "flex" }
+      : variant === "mobile"
+      ? { background: "none", border: "none", fontSize: 18, cursor: "pointer", color: "#555", padding: 4, lineHeight: 1 }
+      : { ...headerLinkStyle, cursor: "pointer", background: "#fff" };
+
+  return (
+    <div ref={ref} style={{ position: "relative" }}>
+      <button onClick={() => setOpen(o => !o)} title="프로젝트 링크 (Jira · Confluence · GitHub)" style={buttonStyle}>
+        {variant === "header" ? "🔗 링크" : "🔗"}
+      </button>
+      {open && (
+        <div style={{
+          position: "absolute", top: "calc(100% + 4px)", right: 0, zIndex: 30,
+          background: "#fff", border: "0.5px solid #e5e5e5", borderRadius: 8,
+          boxShadow: "0 4px 16px rgba(0,0,0,0.08)", minWidth: 160, overflow: "hidden",
+        }}>
+          {links.map(l => (
+            <a key={l.label} href={l.url} target="_blank" rel="noreferrer" onClick={() => setOpen(false)}
+              style={{
+                display: "flex", alignItems: "center", gap: 8, padding: "8px 12px",
+                fontSize: 13, color: "#333", textDecoration: "none", whiteSpace: "nowrap",
+              }}>
+              <span>{l.icon}</span><span>{l.label}</span>
+            </a>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const INITIAL_AGENTS = (): AgentState[] => [
   { name: "pm",        label: "PM",        status: "pending", progress: 0, lastMessage: "" },
   { name: "designer",  label: "Designer",  status: "pending", progress: 0, lastMessage: "" },
@@ -899,12 +955,14 @@ function TunnelBanner() {
 }
 
 // ── 프로젝트 목록 (사이드바 내용) ───────────────────────────────
-function ProjectList({ projects, activeId, onSelect, onCreate, connected, githubRepos, repoLoading, onConnectRepo, onRefreshRepos, onDeactivate }: {
+function ProjectList({ projects, activeId, onSelect, onCreate, connected, githubRepos, repoLoading, onConnectRepo, onRefreshRepos, onDeactivate, onActivate, onDiscard }: {
   projects: Project[]; activeId: string; onSelect: (id: string) => void;
   onCreate: () => void; connected: boolean;
   githubRepos: GithubRepo[]; repoLoading: boolean;
   onConnectRepo: (repo: GithubRepo) => void; onRefreshRepos: () => void;
   onDeactivate: (projectId: string) => void;
+  onActivate: (projectId: string) => void;
+  onDiscard: (projectId: string, name: string) => void;
 }) {
   const sectionHeaderStyle = { padding: "12px 16px 6px", fontSize: 11, fontWeight: 500, color: "#aaa", display: "flex", alignItems: "center", justifyContent: "space-between" };
   return (
@@ -925,19 +983,24 @@ function ProjectList({ projects, activeId, onSelect, onCreate, connected, github
               <span title={active ? "실행 중" : "대기 중 (다시 실행 가능)"}
                 style={{ width: 6, height: 6, borderRadius: "50%", flexShrink: 0, background: active ? "#EF9F27" : "#ccc" }} />
               <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
-              {active && (
+              {active ? (
                 <button onClick={e => { e.stopPropagation(); onDeactivate(p.id); }} title="인액티브로 전환 (일시정지, 나중에 대화로 재개 가능)"
                   style={{ flexShrink: 0, border: "0.5px solid #e5c5c5", background: "#fff", color: "#c07070", borderRadius: 4, fontSize: 10, padding: "1px 5px", cursor: "pointer", lineHeight: 1.4 }}>
                   정지
                 </button>
+              ) : (
+                <button onClick={e => { e.stopPropagation(); onActivate(p.id); }} title="팀을 다시 기동해서 이어서 실행"
+                  style={{ flexShrink: 0, border: "0.5px solid #c5d5c8", background: "#fff", color: "#3f8f5c", borderRadius: 4, fontSize: 10, padding: "1px 5px", cursor: "pointer", lineHeight: 1.4 }}>
+                  재실행
+                </button>
               )}
-              {p.repo && (
-                <a href={`https://github.com/${p.repo}`} target="_blank" rel="noreferrer"
-                  onClick={e => e.stopPropagation()} title={`GitHub: ${p.repo}`}
-                  style={{ flexShrink: 0, color: "#bbb", textDecoration: "none", fontSize: 12, lineHeight: 1, display: "flex" }}>
-                  🔗
-                </a>
-              )}
+              <button onClick={e => { e.stopPropagation(); onDiscard(p.id, p.name); }} title="프로젝트 폐기 (되돌릴 수 없음)"
+                style={{ flexShrink: 0, border: "0.5px solid #F0C6C6", background: "#fff", color: "#A32D2D", borderRadius: 4, fontSize: 10, padding: "1px 5px", cursor: "pointer", lineHeight: 1.4 }}>
+                폐기
+              </button>
+              <div onClick={e => e.stopPropagation()} style={{ flexShrink: 0 }}>
+                <ProjectLinksMenu project={p} variant="compact" />
+              </div>
             </div>
           );
         })}
@@ -1266,6 +1329,21 @@ export default function Home() {
     await fetch(`${API_URL}/projects/${projectId}/deactivate`, { method: "POST" }).catch(() => {});
   };
 
+  const activateProject = async (projectId: string) => {
+    await fetch(`${API_URL}/projects/${projectId}/activate`, { method: "POST" }).catch(() => {});
+  };
+
+  // project_removed 브로드캐스트가 오면 프론트 상태(projects/activeId)는 위 WS
+  // 핸들러가 알아서 정리한다 — 여기서는 확인창 + 삭제 요청만 담당.
+  const discardProject = async (projectId: string, name: string) => {
+    if (!window.confirm(`'${name}' 프로젝트를 폐기할까요? 되돌릴 수 없습니다.`)) return;
+    const res = await fetch(`${API_URL}/projects/${projectId}`, { method: "DELETE" }).catch(() => null);
+    if (res && !res.ok) {
+      const data = await res.json().catch(() => null);
+      window.alert(data?.detail || "프로젝트를 폐기하지 못했습니다.");
+    }
+  };
+
   // ── 탭 스위처 + 플로우차트 (공통, desktop/mobile 둘 다 씀) ────────
   const tabBar = (
     <div style={{ display: "flex", gap: 4, padding: "8px 20px 0", borderBottom: "0.5px solid #e5e5e5", flexShrink: 0 }}>
@@ -1394,7 +1472,8 @@ export default function Home() {
             }}>
               <div style={{ width: 200, height: "100%" }}>
                 <ProjectList projects={sortedProjects} activeId={activeId} onSelect={setActiveId} onCreate={() => setShowModal(true)} connected={connected}
-                  githubRepos={githubRepos} repoLoading={repoLoading} onConnectRepo={r => createProject(r.name, r.full_name)} onRefreshRepos={fetchGithubRepos} onDeactivate={deactivateProject} />
+                  githubRepos={githubRepos} repoLoading={repoLoading} onConnectRepo={r => createProject(r.name, r.full_name)} onRefreshRepos={fetchGithubRepos}
+                  onDeactivate={deactivateProject} onActivate={activateProject} onDiscard={discardProject} />
               </div>
             </div>
             <button onClick={toggleSidebar} title={sidebarCollapsed ? "프로젝트 목록 펼치기" : "프로젝트 목록 접기"}
@@ -1416,14 +1495,7 @@ export default function Home() {
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <button onClick={() => setDesignOpen(true)} title="디자인 (적용된 디자인 · 적용 전 새 디자인, 시나리오별)"
                   style={{ fontSize: 16, color: "#888", border: "0.5px solid #e5e5e5", background: "#fff", padding: "4px 10px", borderRadius: 6, cursor: "pointer", lineHeight: 1 }}>🎨</button>
-                {activeProject?.jira?.jira_url && (
-                  <a href={activeProject.jira.jira_url} target="_blank" rel="noreferrer"
-                    style={headerLinkStyle} title={`Jira: ${activeProject.jira.epic}`}>📋 Jira</a>
-                )}
-                {activeProject?.repo && (
-                  <a href={`https://github.com/${activeProject.repo}`} target="_blank" rel="noreferrer"
-                    style={headerLinkStyle} title={`GitHub: ${activeProject.repo}`}>🔗 GitHub</a>
-                )}
+                <ProjectLinksMenu project={activeProject} />
                 <button onClick={() => setOutputsOpen(true)} title="산출물 (디자인 · 영상 · 스크린샷, 최신순)"
                   style={{ fontSize: 16, color: "#888", border: "0.5px solid #e5e5e5", background: "#fff", padding: "4px 10px", borderRadius: 6, cursor: "pointer", lineHeight: 1 }}>🗂</button>
                 <button onClick={() => setDetailOpen(true)} title="상세 정보 (팀 현황 · 로그 · PR)"
@@ -1459,6 +1531,8 @@ export default function Home() {
                   onConnectRepo={r => { createProject(r.name, r.full_name); setDrawerOpen(false); }}
                   onRefreshRepos={fetchGithubRepos}
                   onDeactivate={deactivateProject}
+                  onActivate={activateProject}
+                  onDiscard={discardProject}
                 />
               </div>
             </>
@@ -1475,14 +1549,7 @@ export default function Home() {
             </div>
             <button onClick={() => setDesignOpen(true)} title="디자인"
               style={{ background: "none", border: "none", fontSize: 18, cursor: "pointer", color: "#555", padding: 4, lineHeight: 1 }}>🎨</button>
-            {activeProject?.jira?.jira_url && (
-              <a href={activeProject.jira.jira_url} target="_blank" rel="noreferrer" title="Jira"
-                style={{ fontSize: 18, lineHeight: 1, padding: 4 }}>📋</a>
-            )}
-            {activeProject?.repo && (
-              <a href={`https://github.com/${activeProject.repo}`} target="_blank" rel="noreferrer" title="GitHub"
-                style={{ fontSize: 18, lineHeight: 1, padding: 4 }}>🔗</a>
-            )}
+            <ProjectLinksMenu project={activeProject} variant="mobile" />
             <button onClick={() => setOutputsOpen(true)} title="산출물"
               style={{ background: "none", border: "none", fontSize: 18, cursor: "pointer", color: "#555", padding: 4, lineHeight: 1 }}>🗂</button>
             <button onClick={() => setDetailOpen(true)} title="상세 정보"
