@@ -1500,7 +1500,7 @@ export default function Home() {
                   style={{ fontSize: 16, color: "#888", border: "0.5px solid #e5e5e5", background: "#fff", padding: "4px 10px", borderRadius: 6, cursor: "pointer", lineHeight: 1 }}>🗂</button>
                 <button onClick={() => setDetailOpen(true)} title="상세 정보 (팀 현황 · 로그 · PR)"
                   style={{ fontSize: 16, color: "#888", border: "0.5px solid #e5e5e5", background: "#fff", padding: "4px 10px", borderRadius: 6, cursor: "pointer", lineHeight: 1 }}>⋯</button>
-                <a href={`${API_URL}/docs`} target="_blank" rel="noreferrer" style={headerLinkStyle}>API 문서</a>
+                <a href="/docs" target="_blank" rel="noreferrer" style={headerLinkStyle}>API 문서</a>
               </div>
             </div>
             {tabBar}
