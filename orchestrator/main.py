@@ -1732,6 +1732,20 @@ async def deactivate_project(project_id: str):
     await broadcast({"type": "project_updated", "project_id": project_id, "projects": {pid: _make_project_info(pid) for pid in projects}})
     return {"ok": True}
 
+@app.post("/projects/{project_id}/activate")
+async def activate_project(project_id: str):
+    """사이드바 '재실행' 버튼 — 정지된(인액티브) 프로젝트의 팀 컨테이너를 새
+    채팅 없이 바로 재기동한다. spawn_team은 이미 떠 있으면 그대로 두는 멱등
+    함수라 이미 활성 상태인 프로젝트에서 눌려도 안전하다."""
+    p = projects.get(project_id)
+    if not p:
+        raise HTTPException(404)
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, spawner.spawn_team, project_id, ANTHROPIC_API_KEY)
+    await broadcast({"type": "project_updated", "project_id": project_id, "projects": {pid: _make_project_info(pid) for pid in projects}})
+    return {"ok": True}
+
+
 @app.delete("/projects/{project_id}")
 async def delete_project(project_id: str):
     if project_id == DEFAULT_PROJECT_ID:
