@@ -64,9 +64,14 @@ PIPELINE_DEFINITION: list[Stage] = [
 
 
 class Pipeline:
-    def __init__(self, project_id: str, instruction: str):
+    def __init__(self, project_id: str, instruction: str, sprint: int = 1):
         self.project_id = project_id
         self.instruction = instruction
+        # planning부터 전체 파이프라인을 되돌리는 재기획(_retry_planning_with_feedback)
+        # 때마다 1씩 늘어나는 "몇 번째 재기획 라운드인지" 카운터. 그 시점에 새로 생성되는
+        # 이슈/디자인 결과물에 태그로 붙여서, mtime만으로 짐작하던 "이번 라운드 산출물"을
+        # 명시적으로 구분할 수 있게 한다.
+        self.sprint = sprint
         self.stages: dict[str, Stage] = {s.name: s for s in [
             Stage(s.name, s.agents[:], s.depends_on[:], s.requires_approval)
             for s in PIPELINE_DEFINITION
@@ -119,6 +124,7 @@ class Pipeline:
     def summary(self) -> dict:
         return {
             "project_id": self.project_id,
+            "sprint": self.sprint,
             "stages": {
                 name: {"status": s.status, "agents": s.agents, "outputs": s.outputs, "approved": s.approved}
                 for name, s in self.stages.items()
