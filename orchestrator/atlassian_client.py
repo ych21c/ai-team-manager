@@ -374,6 +374,21 @@ async def link_pr_to_jira(issue_key: str, pr_url: str, repo: str) -> bool:
         return r.status_code == 201
 
 
+async def add_jira_remote_link(issue_key: str, url: str, title: str) -> bool:
+    """URL 하나를 Jira 이슈에 원격 링크로 등록하는 범용 함수. link_pr_to_jira와
+    같은 엔드포인트를 쓰지만 title을 호출부가 지정할 수 있다(PR 링크 외에도
+    QA 녹화 영상처럼 스프린트별로 계속 남는 산출물 링크를 걸 때 씀)."""
+    if not all([EMAIL, TOKEN, DOMAIN]):
+        return False
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            f"https://{DOMAIN}/rest/api/3/issue/{issue_key}/remotelink",
+            headers=_auth_header(),
+            json={"object": {"url": url, "title": title}},
+        )
+        return r.status_code == 201
+
+
 async def add_jira_attachment(issue_key: str, file_path: str, filename: str | None = None) -> bool:
     """Jira 이슈에 파일을 첨부한다. 링크와 달리, 나중에 로컬 파일이 다음 라운드
     산출물로 덮어써지거나 지워져도(QA 녹화 영상 qa_recording.mp4처럼 매 라운드
