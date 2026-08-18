@@ -33,7 +33,7 @@ from team_spawner import TeamSpawner
 from atlassian_client import (
     sync_pm_output, update_jira_status, add_jira_comment, link_pr_to_jira,
     add_jira_attachment, create_confluence_page, update_confluence_page,
-    create_jira_stories, parse_pm_requirements,
+    create_jira_stories, parse_pm_requirements, DOMAIN,
 )
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -68,6 +68,33 @@ CHAT_TRIAGE_TIMEOUT_SEC = 120   # 이 시간이 지나면 stale로 보고 새 tr
 ws_clients:     set[WebSocket]     = set()
 redis   = RedisQueue(os.getenv("REDIS_URL", "redis://localhost:6379"))
 spawner = TeamSpawner()
+
+
+def _story_link(project_id: str, key: str, identifier: str) -> str:
+    """웹 채팅에 이슈 키만 툭 던지지 않고 "[identifier] [KEY: 실제 제목](Jira URL)"
+    형태로 만든다 — web/app/page.tsx의 linkifyContent가 마크다운 [text](url)를
+    클릭 가능한 링크로 바꿔주므로 프런트는 안 건드리고 여기서 라벨만 채운다.
+    identifier(spec/design/impl/qa/bug/release 등)를 링크 텍스트 "안"에 대괄호로
+    같이 넣으면 linkifyContent의 정규식(\\[[^\\]]+\\]\\([^)]+\\))이 첫 "]" 뒤에
+    "("가 안 와서 매칭이 깨지므로, 링크 밖에 별도 접두어로 붙인다."""
+    title = project_jira.get(project_id, {}).get("story_titles", {}).get(key, "")
+    text = f"{key}: {title}" if title else key
+    link = f"[{text}](https://{DOMAIN}/browse/{key})" if DOMAIN else text
+    return f"[{identifier}] {link}"
+
+
+def _story_link_list(project_id: str, keys: list[str], identifier: str) -> str:
+    return ", ".join(_story_link(project_id, key, identifier) for key in keys)
+
+
+def _story_plain(project_id: str, key: str, identifier: str) -> str:
+    """_story_link와 같은 라벨이지만 마크다운 링크 없이 순수 텍스트로 — Confluence
+    히스토리(_render_project_doc_html)는 마크다운을 해석하지 않고 그대로
+    HTML 이스케이프해서 보여주므로, 거기 들어갈 텍스트는 이 버전을 쓴다."""
+    title = project_jira.get(project_id, {}).get("story_titles", {}).get(key, "")
+    text = f"{key}: {title}" if title else key
+    return f"[{identifier}] {text}"
+
 
 # 기본 프로젝트 초기화 (서버 시작 시)
 DEFAULT_PROJECT_ID   = "self-improve"
@@ -313,26 +340,29 @@ async def handle_agent_event(event: dict):
                 await add_jira_comment(existing["epic"], f"📋 PRD 갱신:\n{pm_text}")
                 new_records = await _sync_new_requirements_to_epic(project_id, pm_text)
                 if new_records:
-                    lines = "\n".join(f"• [{r['key']}] {r['title']}" for r in new_records)
+                    lines = "\n".join(
+                        f"• {_story_link(project_id, r['key'], 'spec')}" for r in new_records
+                    )
                     await broadcast({
                         "type": "agent_message", "project_id": project_id, "agent": "system",
-                        "content": f"📋 기존 Epic({existing['epic']}) 아래 신규 이슈 {len(new_records)}건 생성\n{lines}",
+                        "content": f"📋 기존 Epic({existing['epic']}: {pname}) 아래 신규 이슈 {len(new_records)}건 생성\n{lines}",
                     })
                 else:
                     await broadcast({
                         "type": "agent_message", "project_id": project_id, "agent": "system",
-                        "content": f"📋 기존 Jira 연결 유지 — Epic: {existing['epic']} (새로 만들 이슈 없음, 갱신 코멘트만 추가)",
+                        "content": f"📋 기존 Jira 연결 유지 — Epic: [spec] [{existing['epic']}: {pname}](https://{DOMAIN}/browse/{existing['epic']}) (새로 만들 이슈 없음, 갱신 코멘트만 추가)",
                     })
             else:
                 atlassian = await sync_pm_output(pname, pm_text)
                 if atlassian.get("epic"):
                     project_jira[project_id] = atlassian
+                    story_list = _story_link_list(project_id, atlassian.get("stories", []), "spec")
                     await broadcast({
                         "type": "agent_message", "project_id": project_id, "agent": "system",
                         "content": (
                             f"📋 Jira 등록 완료\n"
-                            f"• Epic: [{atlassian['epic']}]({atlassian['jira_url']})\n"
-                            f"• Stories: {', '.join(atlassian.get('stories', []))}"
+                            f"• Epic: [spec] [{atlassian['epic']}: {pname}]({atlassian['jira_url']})\n"
+                            f"• Stories: {story_list}"
                         ),
                     })
 
@@ -398,11 +428,12 @@ async def handle_agent_event(event: dict):
                 if os.path.exists(video_path):
                     await add_jira_attachment(story, video_path, filename=f"qa_recording_{video_ts}.mp4")
             if stories:
+                story_list = _story_link_list(project_id, stories, "qa" if passed else "bug")
                 await broadcast({
                     "type": "agent_message",
                     "project_id": project_id,
                     "agent": "system",
-                    "content": f"{'✅' if passed else '⚠️'} Jira Stories에 QA 결과 기록: {', '.join(stories)}",
+                    "content": f"{'✅' if passed else '⚠️'} Jira Stories에 QA 결과 기록: {story_list}",
                 })
             await _add_history(project_id, f"{'✅' if passed else '⚠️'} QA {'통과' if passed else '이슈 발견'}: {outputs.get('summary', '')}")
 
@@ -448,9 +479,10 @@ async def handle_agent_event(event: dict):
                 await update_jira_status(story, "Done")
                 await add_jira_comment(story, f"🚀 릴리즈 완료: {outputs.get('summary', '')}")
             if stories:
+                story_list = _story_link_list(project_id, stories, "release")
                 await broadcast({
                     "type": "agent_message", "project_id": project_id, "agent": "system",
-                    "content": f"🚀 릴리즈 완료 — Jira Stories Done 처리: {', '.join(stories)}",
+                    "content": f"🚀 릴리즈 완료 — Jira Stories Done 처리: {story_list}",
                 })
             await _add_history(project_id, f"🚀 릴리즈 완료: {outputs.get('summary', '')}")
 
@@ -678,7 +710,7 @@ async def _create_ad_hoc_jira_story(project_id: str, title: str) -> str | None:
     jira.setdefault("story_titles", {})[key] = records[0]["title"]
     await broadcast({
         "type": "agent_message", "project_id": project_id, "agent": "system",
-        "content": f"📋 새 Jira 이슈 생성: [{key}] {records[0]['title']}",
+        "content": f"📋 새 Jira 이슈 생성: {_story_link(project_id, key, 'spec')}",
     })
     return key
 
@@ -749,20 +781,22 @@ async def _handle_chat_triage_result(pipeline: Pipeline, project_id: str, output
         scenario_key = target
 
     if scope == "design" and feedback:
-        scope_note = f" ({scenario_key}만)" if scenario_key else ""
+        scope_note = f" ({_story_link(project_id, scenario_key, 'design')}만)" if scenario_key else ""
+        scope_note_plain = f" ({_story_plain(project_id, scenario_key, 'design')}만)" if scenario_key else ""
         await broadcast({
             "type": "agent_message", "project_id": project_id, "agent": "system",
             "content": f"🔁 PM 판단: 디자인 재작업이 필요합니다{scope_note} — designer/architect부터 다시 시작합니다.\n{feedback}",
         })
-        await _add_history(project_id, f"🔁 채팅 요청 → 디자인 재작업{scope_note}: {feedback}")
+        await _add_history(project_id, f"🔁 채팅 요청 → 디자인 재작업{scope_note_plain}: {feedback}")
         await _retry_design_with_feedback(pipeline, feedback, scenario_key)
     elif scope == "implement" and feedback:
-        scope_note = f" ({scenario_key}만)" if scenario_key else ""
+        scope_note = f" ({_story_link(project_id, scenario_key, 'impl')}만)" if scenario_key else ""
+        scope_note_plain = f" ({_story_plain(project_id, scenario_key, 'impl')}만)" if scenario_key else ""
         await broadcast({
             "type": "agent_message", "project_id": project_id, "agent": "system",
             "content": f"🔁 PM 판단: 구현 수정이 필요합니다{scope_note} — Implement에 재작업을 요청합니다.\n{feedback}",
         })
-        await _add_history(project_id, f"🔁 채팅 요청 → 구현 재작업{scope_note}: {feedback}")
+        await _add_history(project_id, f"🔁 채팅 요청 → 구현 재작업{scope_note_plain}: {feedback}")
         await _retry_implement_with_feedback(pipeline, feedback, scenario_key)
     else:
         await broadcast({
