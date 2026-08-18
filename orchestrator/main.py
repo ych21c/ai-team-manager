@@ -400,8 +400,9 @@ async def handle_agent_event(event: dict):
             target_stories = _implement_jira_comment_targets(outputs.get("scenario_key"), stories)
             comment = f"🤖 구현 완료 — PR: {pr_url}" if pr_url else f"⚠️ 구현 단계 완료했지만 PR 생성 실패: {outputs.get('summary', '')}"
             for story in target_stories:
-                await update_jira_status(story, "In Progress")
-                await add_jira_comment(story, comment)
+                target = _stage_issue_target(project_id, story, "implement")
+                await update_jira_status(target, "In Progress")
+                await add_jira_comment(target, comment)
             await _add_history(project_id, f"🤖 구현 완료 — PR: {pr_url}" if pr_url else "⚠️ 구현 완료했지만 PR 생성 실패")
 
         # QA 완료 → PR 링크 + 결과 코멘트 (통과 여부와 무관하게 무조건 Done으로
@@ -421,12 +422,13 @@ async def handle_agent_event(event: dict):
             video_path = f"/workspace/{project_id}/qa_recording.mp4"
             video_ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
             for story in stories:
+                target = _stage_issue_target(project_id, story, "qa")
                 if pr_url:
-                    await link_pr_to_jira(story, pr_url, repo)
+                    await link_pr_to_jira(target, pr_url, repo)
                 icon = "✅" if passed else "⚠️"
-                await add_jira_comment(story, f"{icon} QA {'통과' if passed else '이슈 발견'}: {outputs.get('summary', '')}")
+                await add_jira_comment(target, f"{icon} QA {'통과' if passed else '이슈 발견'}: {outputs.get('summary', '')}")
                 if os.path.exists(video_path):
-                    await add_jira_attachment(story, video_path, filename=f"qa_recording_{video_ts}.mp4")
+                    await add_jira_attachment(target, video_path, filename=f"qa_recording_{video_ts}.mp4")
             if stories:
                 story_list = _story_link_list(project_id, stories, "qa" if passed else "bug")
                 await broadcast({
@@ -621,7 +623,8 @@ async def _jira_stage_started(project_id: str, stage_name: str):
         return
     stories = project_jira.get(project_id, {}).get("stories", [])
     for story in stories:
-        await add_jira_comment(story, f"{label} 단계 시작")
+        target = _stage_issue_target(project_id, story, stage_name)
+        await add_jira_comment(target, f"{label} 단계 시작")
 
 
 STAGE_LABELS_KO = {"qa": "QA", "autotest": "AutoTest(CI)"}
@@ -705,6 +708,8 @@ async def _create_ad_hoc_jira_story(project_id: str, title: str) -> str | None:
     key = records[0]["key"]
     jira.setdefault("stories", []).append(key)
     jira.setdefault("story_titles", {})[key] = records[0]["title"]
+    if records[0].get("subtasks"):
+        jira.setdefault("story_subtasks", {})[key] = records[0]["subtasks"]
     sprint = projects[project_id].sprint if project_id in projects else 1
     await broadcast({
         "type": "agent_message", "project_id": project_id, "agent": "system",
@@ -751,6 +756,8 @@ async def _sync_new_requirements_to_epic(project_id: str, pm_text: str) -> list[
     for r in records:
         jira.setdefault("stories", []).append(r["key"])
         jira.setdefault("story_titles", {})[r["key"]] = r["title"]
+        if r.get("subtasks"):
+            jira.setdefault("story_subtasks", {})[r["key"]] = r["subtasks"]
 
     return records
 
@@ -954,6 +961,17 @@ async def _retry_implement_with_feedback(pipeline: Pipeline, feedback: str, scen
         "context": context,
         "github_repo": project_repos.get(pid, ""),
     })
+
+
+def _stage_issue_target(project_id: str, story_key: str, stage: str) -> str:
+    """story_key에 대해 이 stage(design/implement/qa)가 실제로 코멘트/상태를
+    남겨야 할 Jira 이슈를 반환한다 — 있으면 그 stage 전용 하위 작업(Subtask),
+    없으면 story 자신에 폴백한다(하위 작업 도입 전에 만들어진 스토리이거나
+    생성이 실패한 경우, 또는 autotest/release처럼 애초에 하위 작업이 없는
+    stage). 이게 없으면 design/impl/qa 코멘트가 전부 스토리 하나에 뒤섞여
+    Jira만 보고는 단계별 진행 상황을 구분할 수 없었다."""
+    subtasks = project_jira.get(project_id, {}).get("story_subtasks", {}).get(story_key, {})
+    return subtasks.get(stage, story_key)
 
 
 def _existing_issues_context(project_id: str) -> list[dict]:
@@ -1613,7 +1631,8 @@ async def publish_design(project_id: str, body: DesignPublish):
             os.remove(src)
             applied_count += 1
             if key in commentable:
-                await add_jira_comment(key, (
+                target = _stage_issue_target(project_id, key, "design")
+                await add_jira_comment(target, (
                     f"🎨 디자인 목업 반영 (Sprint {sprint} · 버전 {ts})\n"
                     f"최신: {PUBLIC_BASE_URL}/design-file/{project_id}/applied/{key}\n"
                     f"이 버전: {PUBLIC_BASE_URL}/design-file/{project_id}/history/{key}/{version}"
