@@ -375,6 +375,41 @@ def parse_scenario_mockups(full_response: str) -> dict[str, str]:
     return {}
 
 
+def extract_design_map(full_response: str) -> str:
+    """Designer 응답의 '맵' 부분(screens/components/design_tokens JSON 등, 시나리오
+    HTML 블록 앞에 오는 부분)만 잘라낸다. 화면이 많은 프로젝트(예: recoveryFit,
+    12개 화면)에서 스코프된 재작업 하나 때문에 이전 산출물 파일 전체(다른 화면
+    HTML 전부 포함)를 매번 프롬프트에 다시 넣던 걸 피하려고, 화면 목록/디자인
+    시스템처럼 "안 변하는 작은 맵"만 따로 저장해두고 재사용하기 위한 추출 함수.
+    마커가 없으면(레거시 단일 블록 응답) 잘라낼 맵이 없으므로 빈 문자열."""
+    if "## SCENARIO:" not in full_response:
+        return ""
+    return full_response.split("## SCENARIO:", 1)[0].strip()
+
+
+def _prior_scenario_mockups(workspace: str, scenario_keys: list[str]) -> str:
+    """재작업 대상 시나리오의 기존 목업만 골라서 프롬프트용 텍스트로 만든다.
+    design/applied를 우선하고(머지된 최신본), 아직 안 머지됐으면 design/pending으로
+    폴백한다 — qa_testlab의 _list_design_mockups와 같은 우선순위 규칙이지만, 거긴
+    전체 시나리오를 다 모으고 여긴 scenario_keys로 받은 대상만 골라낸다는 점이
+    다르다(대상이 아닌 화면의 HTML은 아예 프롬프트에 안 들어가야 토큰이 준다)."""
+    lines = []
+    for key in scenario_keys:
+        if not key or "/" in key or ".." in key:
+            continue
+        for bucket in ("applied", "pending"):
+            path = f"{workspace}/design/{bucket}/{key}.html"
+            if os.path.exists(path):
+                try:
+                    with open(path, errors="replace") as f:
+                        content = f.read()
+                except OSError:
+                    content = ""
+                lines.append(f"### design/{bucket}/{key}.html\n{content}")
+                break
+    return "\n\n".join(lines)
+
+
 def git_new_branch_commit_push(workspace: str, github_repo: str, branch: str, message: str) -> bool:
     """design 목업을 main에 바로 올리지 않고 새 브랜치에 커밋+푸시한다 — 오케스트레이터가
     이 브랜치로 PR을 만들고 즉시 머지하므로, 머지 전/후 상태를 UI에서 분리해 보여줄 수 있다.
@@ -441,15 +476,37 @@ async def process_task(r: aioredis.Redis, task: dict):
     # 작업하도록 포함시킨다 — 사람 팀원이 자기가 전에 쓴 문서를 기억하고 개정하듯,
     # 매번 백지 상태로 재작성하지 않게 하기 위함.
     workspace = f"/workspace/{project_id}"
-    prior_output = ""
-    prior_path = f"{workspace}/{AGENT_NAME}_output.md"
-    if os.path.exists(prior_path):
-        try:
-            with open(prior_path, errors="replace") as f:
-                prior_output = f.read()
-        except OSError:
-            pass
-    prior_section = f"\n\n## 이 프로젝트에서 이전에 당신이 작성한 산출물 (참고해서 이어서/수정하세요)\n{prior_output}" if prior_output else ""
+    if AGENT_NAME == "designer":
+        # designer_output.md 전체(다른 화면 HTML까지 전부)를 매번 통째로 넣는 대신,
+        # 화면 목록/디자인 시스템 같은 "맵"(작고 안 변함)과, 이번에 실제로 다시
+        # 만드는 대상 화면들의 기존 목업만 넣는다 — recoveryFit처럼 화면이 많은
+        # 프로젝트에서 화면 1개 재작업에 나머지 11개 화면 HTML까지 딸려가던 걸 피함.
+        map_content = ""
+        map_path = f"{workspace}/design/map.json"
+        if os.path.exists(map_path):
+            try:
+                with open(map_path, errors="replace") as f:
+                    map_content = f.read()
+            except OSError:
+                pass
+        target_keys = [s.get("key") for s in (scenarios or []) if s.get("key")]
+        prior_mockups = _prior_scenario_mockups(workspace, target_keys)
+        parts = []
+        if map_content:
+            parts.append(f"## 기존 화면 목록/디자인 시스템 (맵 — 전체 일관성 참고용)\n{map_content}")
+        if prior_mockups:
+            parts.append(f"## 재작업 대상 화면의 기존 목업 (참고해서 이어서/수정하세요)\n{prior_mockups}")
+        prior_section = f"\n\n{chr(10).join(parts)}" if parts else ""
+    else:
+        prior_output = ""
+        prior_path = f"{workspace}/{AGENT_NAME}_output.md"
+        if os.path.exists(prior_path):
+            try:
+                with open(prior_path, errors="replace") as f:
+                    prior_output = f.read()
+            except OSError:
+                pass
+        prior_section = f"\n\n## 이 프로젝트에서 이전에 당신이 작성한 산출물 (참고해서 이어서/수정하세요)\n{prior_output}" if prior_output else ""
 
     user_prompt = f"""프로젝트: {project_id} | 스테이지: {stage}
 지시사항: {instruction}
@@ -544,6 +601,16 @@ async def process_task(r: aioredis.Redis, task: dict):
     # 위 파일은 "최신 버전"만 남기고 이건 전체 개정 이력.
     with open(f"{workspace}/{AGENT_NAME}_history.md", "a") as f:
         f.write(f"\n\n---\n## Stage: {stage}\n\n{full_response}")
+
+    # designer의 "맵"(화면 목록/디자인 시스템 — 시나리오 HTML 블록 앞부분)만 따로
+    # 저장해둔다. 다음 실행의 prior_section이 designer_output.md 전체 대신 이걸
+    # 읽는다 — 목업 파일이 아직 없는 시점이라 아래 git add -A에 안전하게 같이 실린다.
+    if AGENT_NAME == "designer":
+        map_content = extract_design_map(full_response)
+        if map_content:
+            os.makedirs(f"{workspace}/design", exist_ok=True)
+            with open(f"{workspace}/design/map.json", "w") as f:
+                f.write(map_content)
 
     # 산출물(문서)을 스스로 커밋+푸시 — implement가 나중에 쓸어담을 때까지 기다리지
     # 않고, 사람 팀원이 자기 문서를 바로바로 올리듯 즉시 반영한다. design/pending 목업

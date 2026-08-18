@@ -15,7 +15,13 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("ANTHROPIC_API_KEY", "")
 
-from agent import build_summary, parse_scenario_mockups, parse_triage_decision
+from agent import (
+    build_summary,
+    extract_design_map,
+    parse_scenario_mockups,
+    parse_triage_decision,
+    _prior_scenario_mockups,
+)
 
 
 def test_short_response_not_truncated():
@@ -67,6 +73,67 @@ def test_no_html_block_returns_empty():
 def test_rejects_scenario_key_with_path_traversal():
     response = "## SCENARIO:../../etc\n```html\n<html>evil</html>\n```\n"
     assert parse_scenario_mockups(response) == {}
+
+
+# ── extract_design_map / _prior_scenario_mockups ──────────────────────
+# 회귀 대비 — recoveryFit(화면 12개)처럼 화면이 많은 프로젝트에서 화면 1개
+# 재작업 피드백을 보내도 designer_output.md 전체(다른 11개 화면 HTML 포함)가
+# 매번 프롬프트에 통째로 다시 들어가던 문제. "맵"(화면 목록/디자인 시스템 —
+# 시나리오 HTML 앞부분)만 따로 저장해두고, 재작업 대상 화면의 기존 목업만
+# 골라 넣도록 분리했다.
+
+def test_extract_design_map_returns_preamble_before_first_scenario():
+    response = (
+        '{"screens": ["login", "home"], "design_tokens": {"primary": "#000"}}\n\n'
+        "## SCENARIO:ATM-5\n```html\n<html>login</html>\n```\n"
+        "## SCENARIO:ATM-6\n```html\n<html>home</html>\n```\n"
+    )
+    result = extract_design_map(response)
+    assert "design_tokens" in result
+    assert "login</html>" not in result
+    assert "home</html>" not in result
+
+
+def test_extract_design_map_empty_when_no_scenario_marker():
+    assert extract_design_map("그냥 텍스트만 있는 응답입니다") == ""
+
+
+def test_prior_scenario_mockups_prefers_applied_over_pending(tmp_path):
+    applied_dir = tmp_path / "design" / "applied"
+    pending_dir = tmp_path / "design" / "pending"
+    applied_dir.mkdir(parents=True)
+    pending_dir.mkdir(parents=True)
+    (applied_dir / "ATM-5.html").write_text("<button>최신 버전</button>")
+    (pending_dir / "ATM-5.html").write_text("<button>옛 버전</button>")
+
+    result = _prior_scenario_mockups(str(tmp_path), ["ATM-5"])
+
+    assert "최신 버전" in result
+    assert "옛 버전" not in result
+
+
+def test_prior_scenario_mockups_only_includes_target_keys(tmp_path):
+    # recoveryFit 사고 재현 방지 — 화면 8개 중 1개만 대상이면 나머지 7개는
+    # 파일이 있어도 프롬프트에 안 들어가야 한다.
+    applied_dir = tmp_path / "design" / "applied"
+    applied_dir.mkdir(parents=True)
+    for key in [f"ATM-{n}" for n in range(5, 13)]:
+        (applied_dir / f"{key}.html").write_text(f"<html>{key}</html>")
+
+    result = _prior_scenario_mockups(str(tmp_path), ["ATM-5"])
+
+    assert "ATM-5" in result
+    for key in [f"ATM-{n}" for n in range(6, 13)]:
+        assert key not in result
+
+
+def test_prior_scenario_mockups_skips_unsafe_keys(tmp_path):
+    result = _prior_scenario_mockups(str(tmp_path), ["../../etc"])
+    assert result == ""
+
+
+def test_prior_scenario_mockups_empty_when_no_files(tmp_path):
+    assert _prior_scenario_mockups(str(tmp_path), ["ATM-5"]) == ""
 
 
 # ── parse_triage_decision ────────────────────────────────────────────
