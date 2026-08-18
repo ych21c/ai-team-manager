@@ -21,6 +21,7 @@ from agent import (
     extract_design_map,
     parse_scenario_mockups,
     parse_triage_decision,
+    role_summary_fields,
     _prior_scenario_mockups,
 )
 
@@ -228,3 +229,43 @@ def test_pm_prompt_excludes_visual_design_details():
     assert "컬러" in pm_prompt
     assert "패딩" in pm_prompt
     assert "designer" in pm_prompt
+
+
+# ── architect 프롬프트가 설계 원칙/스코프 적합성/구조 산출물을 요구하는지 ──
+# 회귀 테스트 — architect가 tech_stack만 던지고 실제 코드 구조는 안 잡아주던
+# 문제. requirements 규모에 맞는 구조화(과설계/저설계 지양)와, implement가
+# 그대로 따라갈 수 있는 module_structure 산출물을 요구하도록 프롬프트에
+# 명시했다.
+
+def test_architect_prompt_requires_design_principles_and_scope_fit():
+    architect_prompt = ROLE_PROMPTS["architect"]
+    assert "설계 원칙" in architect_prompt
+    assert "스코프" in architect_prompt
+    assert "module_structure" in architect_prompt
+
+
+# ── role_summary_fields — design 스테이지 designer/architect 산출물 분리 ──
+# 회귀 테스트 — 둘 다 "summary"에 쓰면 Pipeline.mark_completed의 shallow
+# merge 때문에 나중에 끝나는 쪽이 먼저 쪽 산출물을 지워버렸다(QA의
+# design_qa_check가 architect의 기술 스펙을 "Designer 스펙"으로 잘못 읽는
+# 사고로 실제 이어짐). architect는 "summary"를 아예 안 쓰고
+# "architecture_summary"만 쓰게 분리했다.
+
+def test_architect_only_writes_architecture_summary_key():
+    fields = role_summary_fields("architect", "architect의 구조 설계")
+    assert fields == {"architecture_summary": "architect의 구조 설계"}
+    assert "summary" not in fields
+
+
+def test_designer_writes_summary_and_design_summary_plus_preview_flag():
+    fields = role_summary_fields("designer", "designer의 목업 요약", design_preview=True)
+    assert fields["summary"] == "designer의 목업 요약"
+    assert fields["design_summary"] == "designer의 목업 요약"
+    assert fields["design_preview"] is True
+
+
+def test_single_agent_roles_keep_plain_summary_key_only():
+    """pm/qa/autotest/release처럼 스테이지에 에이전트가 하나뿐이면 충돌 걱정이
+    없으니 예전처럼 "summary" 하나만 쓰면 된다."""
+    fields = role_summary_fields("pm", "PRD 요약")
+    assert fields == {"summary": "PRD 요약"}

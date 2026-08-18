@@ -194,6 +194,7 @@ def _load_all_projects():
                 pass
             pipeline.stages[stage_name].outputs = stage_data.get("outputs") or {}
             pipeline.stages[stage_name].approved = bool(stage_data.get("approved", False))
+            pipeline.stages[stage_name].agents_done = list(stage_data.get("agents_done") or [])
 
         projects[pid]      = pipeline
         project_names[pid] = data.get("name", pid)
@@ -322,8 +323,16 @@ async def handle_agent_event(event: dict):
             await _add_history(project_id, f"❌ AutoTest(CI) 실패: {outputs.get('summary', '')}")
             return
 
-        pipeline.mark_completed(stage_name, outputs)
-        await broadcast({"type": "stage_update", "project_id": project_id, "stage": stage_name, "status": "completed"})
+        pipeline.mark_completed(stage_name, outputs, agent_name=agent_name)
+        # design처럼 에이전트 여럿(designer+architect)이 한 스테이지를 나눠 맡는
+        # 경우, 방금 건 그중 한 명뿐일 수 있다 — 그래도 이 에이전트의 산출물/
+        # agents_done은 프론트가 바로 반영할 수 있게 항상 전체 스냅샷을 보낸다.
+        # "stage_update"(completed)는 stage.agents 전원이 끝났을 때만 보내서,
+        # 다음 게이트(승인 등)가 나머지 에이전트를 기다리지 않고 열리지 않게 한다.
+        await broadcast({"type": "project_updated", "project_id": project_id, "projects": {pid: _make_project_info(pid) for pid in projects}})
+        stage_now_complete = pipeline.stages[stage_name].status == StageStatus.COMPLETED
+        if stage_now_complete:
+            await broadcast({"type": "stage_update", "project_id": project_id, "stage": stage_name, "status": "completed"})
 
         # PM 완료 → Jira Epic/Story 등록 (이미 있으면 새로 안 만들고 그대로 유지 —
         # 사람 팀 프로젝트처럼 링크가 계속 붙어있어야 하므로) + Confluence 문서 갱신
@@ -378,7 +387,7 @@ async def handle_agent_event(event: dict):
         # 설계 완료 → 아키텍처 섹션 갱신
         elif stage_name == "design":
             if agent_name == "architect":
-                _doc(project_id)["architecture"] = outputs.get("summary", "")
+                _doc(project_id)["architecture"] = outputs.get("architecture_summary", "")
             if agent_name == "designer" and outputs.get("design_preview"):
                 await broadcast({
                     "type": "agent_message", "project_id": project_id, "agent": "system",
@@ -488,7 +497,8 @@ async def handle_agent_event(event: dict):
                 })
             await _add_history(project_id, f"🚀 릴리즈 완료: {outputs.get('summary', '')}")
 
-        await advance_pipeline(pipeline)
+        if stage_now_complete:
+            await advance_pipeline(pipeline)
     elif event_type == "progress":
         await broadcast({
             "type": "agent_progress",

@@ -43,6 +43,13 @@ class Stage:
     # 시나리오 목록으로 쓰고 바로 None으로 비운다 — 영구 상태가 아니라 "다음
     # 실행 한 번"에만 적용되는 값이라 세션 스냅샷에 저장할 필요 없음.
     scenario_scope: list[dict] | None = None
+    # design처럼 agents가 여럿(designer+architect)인 스테이지에서, 이번 실행
+    # 라운드에 실제로 stage_completed를 보고한 에이전트 이름들. mark_completed가
+    # agent_name과 함께 호출될 때만 쓰이고, stage.agents 전원이 여기 모여야
+    # 스테이지가 진짜 COMPLETED로 전이한다(먼저 끝난 한 명만으로 착각해 다음
+    # 게이트를 열어버리던 문제를 막기 위함). mark_running이 매 라운드 시작 시
+    # 비운다.
+    agents_done: list[str] = field(default_factory=list)
 
 
 PIPELINE_DEFINITION: list[Stage] = [
@@ -92,15 +99,32 @@ class Pipeline:
         return ready
 
     def mark_running(self, stage_name: str):
-        self.stages[stage_name].status = StageStatus.RUNNING
+        stage = self.stages[stage_name]
+        stage.status = StageStatus.RUNNING
+        stage.agents_done = []  # 새 실행 라운드 — 지난 라운드에 보고한 에이전트 기록 초기화
 
-    def mark_completed(self, stage_name: str, outputs: dict = {}):
-        self.stages[stage_name].status = StageStatus.COMPLETED
-        # design처럼 에이전트 2개(designer+architect)가 같은 스테이지를 병렬로
-        # 끝내는 경우, 나중에 끝난 쪽이 먼저 끝난 쪽 outputs를 통째로 덮어써서
-        # 날려버리던 문제가 있었다 — merge해서 둘 다 보존한다.
-        existing = self.stages[stage_name].outputs or {}
-        self.stages[stage_name].outputs = {**existing, **outputs}
+    def mark_completed(self, stage_name: str, outputs: dict = {}, agent_name: str | None = None):
+        """스테이지 완료 처리. design처럼 에이전트 2개(designer+architect)가 같은
+        스테이지를 병렬로 끝내는 경우, 나중에 끝난 쪽이 먼저 끝난 쪽 outputs를
+        통째로 덮어써서 날려버리던 문제가 있었다 — merge해서 둘 다 보존한다.
+
+        agent_name을 주면(실제 파이프라인 이벤트 경로) 이 스테이지를 담당하는
+        에이전트 전원(stage.agents)이 보고해야 실제로 COMPLETED로 전이한다 —
+        안 그러면 designer/architect 중 먼저 끝난 쪽만으로 스테이지가 끝났다고
+        착각해 다음 게이트(구현 시작 승인 등)가 나머지 에이전트를 기다리지 않고
+        열려버렸다. agent_name을 안 주면(테스트에서 파이프라인을 특정 상태로
+        미리 세팅할 때처럼) 예전처럼 즉시 COMPLETED로 전이한다."""
+        stage = self.stages[stage_name]
+        existing = stage.outputs or {}
+        stage.outputs = {**existing, **outputs}
+        if agent_name is None:
+            stage.status = StageStatus.COMPLETED
+            return
+        if agent_name not in stage.agents_done:
+            stage.agents_done.append(agent_name)
+        stage.status = (
+            StageStatus.COMPLETED if set(stage.agents_done) >= set(stage.agents) else StageStatus.RUNNING
+        )
 
     def mark_failed(self, stage_name: str, outputs: dict = {}):
         """실패 시 COMPLETED로 전이시키지 않아 후속 스테이지가 절대 실행되지 않게 한다."""
@@ -126,7 +150,10 @@ class Pipeline:
             "project_id": self.project_id,
             "sprint": self.sprint,
             "stages": {
-                name: {"status": s.status, "agents": s.agents, "outputs": s.outputs, "approved": s.approved}
+                name: {
+                    "status": s.status, "agents": s.agents, "outputs": s.outputs,
+                    "approved": s.approved, "agents_done": s.agents_done,
+                }
                 for name, s in self.stages.items()
             }
         }

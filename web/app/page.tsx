@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import type { CSSProperties } from "react";
 import { reconcileApprovals } from "./reconcileApprovals";
 import { formatMessageTime } from "./formatTime";
-import { canDiscardStage } from "./flowchartRules";
+import { canDiscardStage, agentSubStatus } from "./flowchartRules";
 
 // ── 타입 ──────────────────────────────────────────────────────────
 type AgentStatus = "pending" | "running" | "completed" | "failed" | "waiting_approval";
@@ -14,11 +14,11 @@ interface AgentState {
 interface StageOutputs {
   summary?: string; branch?: string; pr_number?: number; pr_url?: string;
   head_sha?: string; passed?: boolean; video_available?: boolean; agent?: string;
-  design_preview?: boolean;
+  design_preview?: boolean; design_summary?: string; architecture_summary?: string;
   input_tokens?: number; output_tokens?: number; cost_usd?: number;
   needs_rework?: boolean; feedback?: string;
 }
-interface StageInfo { status: string; agents: string[]; outputs?: StageOutputs; approved?: boolean; }
+interface StageInfo { status: string; agents: string[]; outputs?: StageOutputs; approved?: boolean; agents_done?: string[]; }
 interface Message {
   id: string; from: string; content: string; ts: number; video?: string;
 }
@@ -533,6 +533,13 @@ const STAGE_META: Record<StageName, { label: string; agents: string[] }> = {
   autotest:  { label: "AutoTest",  agents: ["autotest"] },
   release:   { label: "Release",   agents: ["release"] },
 };
+// design 스테이지처럼 에이전트가 여럿인 곳에서, 각 에이전트가 자기 산출물을
+// 어느 outputs 키에 남기는지 — orchestrator/agents/base/agent.py가 designer/
+// architect를 서로 다른 키로 분리해서 쓰는 것과 짝을 맞춤(같은 "summary"에
+// 같이 쓰면 나중에 끝나는 쪽이 먼저 쪽을 덮어써서 구분이 안 됨).
+const AGENT_SUMMARY_KEY: Record<string, keyof StageOutputs> = {
+  designer: "design_summary", architect: "architecture_summary",
+};
 
 // 서버 status만 보고 "지금 사람이 봐야 할 지점"을 순수 계산한다 — waiting_approval이든
 // (정상 흐름) 폐기 직후의 pending+outputs 비어있음이든 이 함수 하나로 동일하게
@@ -675,7 +682,31 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
               게이트 통과 후 자동 시작 — 입력은 이전 스테이지 산출물
             </div>
           )}
-          {outputs?.summary && (
+          {meta.agents.length > 1 ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {meta.agents.map(a => {
+                const aMeta = AGENT_META[a] ?? { label: a, color: "#666", bg: "#f0f0f0" };
+                const aStatus = agentSubStatus(status, a, stageInfo?.agents_done) as AgentStatus;
+                const aSummary = outputs?.[AGENT_SUMMARY_KEY[a] ?? "summary"];
+                return (
+                  <div key={a} style={{ background: "#fff", border: "0.5px solid #e5e5e5", borderRadius: 6, padding: "6px 8px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontSize: 11.5, fontWeight: 500, color: aMeta.color, display: "flex", alignItems: "center", gap: 5 }}>
+                        <span style={{ width: 6, height: 6, borderRadius: "50%", background: aMeta.bg, border: `1.5px solid ${aMeta.color}`, display: "inline-block" }} />
+                        {aMeta.label}
+                      </span>
+                      <StatusBadge status={aStatus} />
+                    </div>
+                    {aSummary && (
+                      <div style={{ fontSize: 11.5, lineHeight: 1.5, color: "#555", marginTop: 4, maxHeight: 120, overflow: "auto", whiteSpace: "pre-wrap" }}>
+                        {String(aSummary).slice(0, 1500)}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ) : outputs?.summary && (
             <div style={{ fontSize: 12, lineHeight: 1.6, background: "#fff", border: "0.5px solid #e5e5e5", borderRadius: 6, padding: "8px 10px", maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap" }}>
               {String(outputs.summary).slice(0, 2000)}
             </div>
