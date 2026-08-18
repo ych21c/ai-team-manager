@@ -22,15 +22,31 @@ def _auth_header() -> dict:
     }
 
 
-_issue_types_cache: tuple[str, str] | None = None
+_issue_types_cache: tuple[str, str, str] | None = None
 
 
-async def _get_issue_types() -> tuple[str, str]:
+def _pick_issue_types(types: list[dict]) -> tuple[str, str, str]:
+    """createmeta가 돌려준 이슈 타입 목록에서 (에픽용, 스토리용, 서브태스크용)
+    이름을 골라낸다. hierarchyLevel(1=에픽, 0=스토리)과 subtask 플래그로
+    구분한다 — 이름을 하드코딩하면 팀 관리형 프로젝트나 로케일이 다른
+    인스턴스에서 계속 400으로 실패한다. 에픽 레벨(1) 타입이 아직 없는
+    프로젝트(과거 "작업"만 있던 2단 구성)에서는 스토리용 타입을 에픽 자리에도
+    그대로 써서 예전 2단 동작으로 자연히 폴백한다. HTTP 호출과 분리해서 순수
+    함수로 둔 이유는 이 선택 로직만 목킹 없이 단위 테스트하기 위함."""
+    story = next((t["name"] for t in types if not t.get("subtask") and t.get("hierarchyLevel", 0) <= 0), "Task")
+    epic  = next((t["name"] for t in types if not t.get("subtask") and t.get("hierarchyLevel", 0) > 0), story)
+    child = next((t["name"] for t in types if t.get("subtask")), "Subtask")
+    return epic, story, child
+
+
+async def _get_issue_types() -> tuple[str, str, str]:
     """이 Jira 프로젝트에서 실제로 쓸 수 있는 이슈 타입을 조회해서
-    (상위용, 하위용)으로 반환한다. "Epic"/"Task"를 이름으로 하드코딩하면
-    팀 관리형 프로젝트나 로케일이 다른 인스턴스에서 이슈 타입이 없어
-    400으로 계속 실패한다(실제로 이 프로젝트는 "작업"/"하위 작업"만 있음) —
-    그래서 서브태스크 여부로 구분해 동적으로 골라 쓴다."""
+    (에픽용, 스토리용, 서브태스크용) 3단으로 반환한다. 이름을 하드코딩하면
+    팀 관리형 프로젝트나 로케일이 다른 인스턴스에서 이슈 타입이 없어 400으로
+    계속 실패하므로, hierarchyLevel(1=에픽, 0=스토리)과 subtask 플래그로
+    동적으로 골라 쓴다. 에픽 레벨(1) 타입이 이 프로젝트에 아직 없으면(과거
+    "작업"만 있던 2단 구성) 스토리용 타입을 에픽 자리에도 그대로 써서 예전
+    2단 동작으로 자연히 폴백한다."""
     global _issue_types_cache
     if _issue_types_cache is not None:
         return _issue_types_cache
@@ -42,14 +58,13 @@ async def _get_issue_types() -> tuple[str, str]:
         )
         if r.status_code != 200:
             print(f"[jira] 이슈 타입 조회 실패 ({r.status_code}): {r.text[:200]}")
-            _issue_types_cache = ("Task", "Subtask")
+            _issue_types_cache = ("Task", "Task", "Subtask")
             return _issue_types_cache
         projects = r.json().get("projects", [])
         types = projects[0].get("issuetypes", []) if projects else []
-        parent = next((t["name"] for t in types if not t.get("subtask")), "Task")
-        child  = next((t["name"] for t in types if t.get("subtask")), "Subtask")
-        _issue_types_cache = (parent, child)
-        print(f"[jira] 이슈 타입 확인됨: 상위='{parent}', 하위='{child}'")
+        epic, story, child = _pick_issue_types(types)
+        _issue_types_cache = (epic, story, child)
+        print(f"[jira] 이슈 타입 확인됨: 에픽='{epic}', 스토리='{story}', 서브태스크='{child}'")
         return _issue_types_cache
 
 
@@ -87,7 +102,7 @@ async def create_jira_epic(project_name: str, summary: str, description: str) ->
     """Epic(대용 상위 이슈) 생성 후 key 반환 (예: ATM-1)."""
     if not all([EMAIL, TOKEN, DOMAIN]):
         return None
-    parent_type, _ = await _get_issue_types()
+    epic_type, _, _ = await _get_issue_types()
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
             f"https://{DOMAIN}/rest/api/3/issue",
@@ -100,7 +115,7 @@ async def create_jira_epic(project_name: str, summary: str, description: str) ->
                         "type": "doc", "version": 1,
                         "content": [{"type": "paragraph", "content": [{"type": "text", "text": description}]}]
                     },
-                    "issuetype": {"name": parent_type},
+                    "issuetype": {"name": epic_type},
                 }
             },
         )
@@ -110,17 +125,55 @@ async def create_jira_epic(project_name: str, summary: str, description: str) ->
     return None
 
 
+STAGE_SUBTASK_LABELS = {"design": "디자인", "implement": "구현", "qa": "QA"}
+
+
+async def create_stage_subtasks(story_key: str, story_title: str) -> dict[str, str]:
+    """Story(요구사항) 밑에 design/implement/qa 하위 작업(Subtask) 3개를 만든다.
+    각 단계가 자기 하위 작업만 업데이트하게 해서, 코멘트만 계속 쌓이던 스토리
+    하나에 세 단계 상태가 뒤섞여 Jira만 보고는 "디자인은 끝났는데 구현은
+    아직인지" 구분이 안 되던 문제를 해결한다.
+    반환: {"design": "ATM-3", "implement": "ATM-4", "qa": "ATM-5"} — 생성 실패한
+    단계는 키가 아예 빠진다(호출부가 .get(stage, story_key)로 story 자체에
+    폴백하도록)."""
+    if not all([EMAIL, TOKEN, DOMAIN]):
+        return {}
+    _, _, subtask_type = await _get_issue_types()
+    result: dict[str, str] = {}
+    async with httpx.AsyncClient(timeout=15) as client:
+        for stage, label in STAGE_SUBTASK_LABELS.items():
+            r = await client.post(
+                f"https://{DOMAIN}/rest/api/3/issue",
+                headers=_auth_header(),
+                json={
+                    "fields": {
+                        "project": {"key": JIRA_PK},
+                        "summary": f"[{label}] {story_title}"[:200],
+                        "issuetype": {"name": subtask_type},
+                        "parent": {"key": story_key},
+                    }
+                },
+            )
+            if r.status_code == 201:
+                result[stage] = r.json().get("key")
+            else:
+                print(f"[jira] {label} 하위 작업 생성 실패 ({r.status_code}): {r.text[:300]}")
+    return result
+
+
 async def create_jira_stories(epic_key: str, project_name: str, requirements: list) -> list[dict]:
-    """요구사항 목록 → Jira Story(대용 하위 이슈) 생성.
+    """요구사항 목록 → Jira Story 생성 + 그 밑에 design/implement/qa 하위 작업
+    3개씩 생성.
     requirements 항목은 문자열(초기 기획의 불릿 목록)이거나 {"id", "title", ...} 형태의
     dict(재작업 시 PM이 REQ-00-A처럼 구조화해 내놓는 개별 요구사항)일 수 있다 —
     dict면 title(없으면 id)을 스토리 제목으로 쓴다. 안 그러면 dict 전체가 str()로
     찍혀 스토리 제목이 알아볼 수 없게 된다.
-    반환: [{"key": "ATM-2", "title": "..."}, ...] — title은 design 스테이지가 시나리오별
-    목업 파일을 만들 때 Jira 스토리 제목으로 라벨을 붙이는 데 쓴다."""
+    반환: [{"key": "ATM-2", "title": "...", "subtasks": {"design": "ATM-3", ...}}, ...]
+    — title은 design 스테이지가 시나리오별 목업 파일을 만들 때 Jira 스토리 제목으로
+    라벨을 붙이는 데 쓴다."""
     if not all([EMAIL, TOKEN, DOMAIN]):
         return []
-    _, child_type = await _get_issue_types()
+    _, story_type, _ = await _get_issue_types()
     stories = []
     async with httpx.AsyncClient(timeout=15) as client:
         for req in requirements[:10]:  # 최대 10개
@@ -135,13 +188,15 @@ async def create_jira_stories(epic_key: str, project_name: str, requirements: li
                     "fields": {
                         "project": {"key": JIRA_PK},
                         "summary": title,
-                        "issuetype": {"name": child_type},
+                        "issuetype": {"name": story_type},
                         "parent": {"key": epic_key},
                     }
                 },
             )
             if r.status_code == 201:
-                stories.append({"key": r.json().get("key"), "title": title})
+                key = r.json().get("key")
+                subtasks = await create_stage_subtasks(key, title)
+                stories.append({"key": key, "title": title, "subtasks": subtasks})
             else:
                 print(f"[jira] Story 생성 실패 ({r.status_code}): {r.text[:300]}")
     return stories
@@ -221,7 +276,8 @@ async def sync_pm_output(project_name: str, pm_output: str) -> dict:
     PM 산출물을 파싱해서 Jira Epic/Story를 등록한다 (Confluence는 여기서 안 만든다 —
     프로젝트 전체 문서는 main.py가 여러 스테이지의 산출물을 모아 하나의 살아있는
     페이지로 별도 관리한다).
-    반환: { "epic": "ATM-1", "stories": ["ATM-2", ...], "jira_url": "...", "summary": "..." }
+    반환: { "epic": "ATM-1", "stories": ["ATM-2", ...],
+            "story_subtasks": {"ATM-2": {"design": "ATM-3", ...}}, "jira_url": "...", "summary": "..." }
     """
     if not all([EMAIL, TOKEN, DOMAIN]):
         return {}
@@ -233,19 +289,21 @@ async def sync_pm_output(project_name: str, pm_output: str) -> dict:
     # Jira Epic 생성
     epic_key = await create_jira_epic(project_name, summary, pm_output[:500])
 
-    # Story 생성
+    # Story 생성 (+ design/implement/qa 하위 작업)
     story_records = []
     if epic_key and requirements:
         story_records = await create_jira_stories(epic_key, project_name, requirements)
     stories = [s["key"] for s in story_records]
     story_titles = {s["key"]: s["title"] for s in story_records}
+    story_subtasks = {s["key"]: s["subtasks"] for s in story_records if s.get("subtasks")}
 
     return {
-        "epic":         epic_key,
-        "stories":      stories,
-        "story_titles": story_titles,
-        "jira_url":     f"https://{DOMAIN}/browse/{epic_key}" if epic_key else None,
-        "summary":      summary,
+        "epic":           epic_key,
+        "stories":        stories,
+        "story_titles":   story_titles,
+        "story_subtasks": story_subtasks,
+        "jira_url":       f"https://{DOMAIN}/browse/{epic_key}" if epic_key else None,
+        "summary":        summary,
     }
 
 
