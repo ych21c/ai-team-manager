@@ -15,6 +15,7 @@ import asyncio
 import html
 import json
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -32,7 +33,7 @@ from workflows.pipeline import Pipeline, StageStatus
 from team_spawner import TeamSpawner
 from atlassian_client import (
     sync_pm_output, update_jira_status, add_jira_comment, link_pr_to_jira,
-    add_jira_attachment, create_confluence_page, update_confluence_page,
+    add_jira_remote_link, create_confluence_page, update_confluence_page,
     create_jira_stories, parse_pm_requirements, DOMAIN,
 )
 
@@ -423,21 +424,27 @@ async def handle_agent_event(event: dict):
             pr_url  = outputs.get("pr_url", "")
             repo    = project_repos.get(project_id, "")
             passed  = outputs.get("passed", True)
-            # QA 녹화 영상은 매 라운드 같은 경로(qa_recording.mp4)에 덮어써져서
-            # 앱 안에서는 "이전 라운드 영상"을 볼 방법이 없다 — 라운드마다 실제
-            # 파일을 Jira 이슈에 첨부해서, 링크가 아니라 그 시점 버전 자체가
-            # 영구 보존되게 한다(첨부는 이슈별 독립 저장이라 코멘트 이력처럼
-            # 라운드가 쌓일수록 자연스럽게 히스토리가 된다).
-            video_path = f"/workspace/{project_id}/qa_recording.mp4"
+            # QA 녹화 영상은 매 라운드 같은 경로(qa_recording.mp4)에 덮어써져서,
+            # 그대로 링크만 걸면 다음 라운드가 시작되는 순간 링크가 이번 라운드
+            # 영상이 아니라 최신 영상을 가리키게 된다 — 그래서 스프린트 태그가
+            # 붙은 이력 파일로 먼저 복사해두고(_archive_qa_recording, design/
+            # history와 같은 패턴), 그 고정된 버전을 링크한다. 웹에서도 같은
+            # 파일을 /recordings/{project_id}/history/{version}으로 그대로 열어볼
+            # 수 있다(collect_outputs가 산출물 패널에 스프린트별로 나열).
             video_ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+            video_version = _archive_qa_recording(project_id, pipeline.sprint, video_ts)
             for story in stories:
                 target = _stage_issue_target(project_id, story, "qa")
                 if pr_url:
                     await link_pr_to_jira(target, pr_url, repo)
                 icon = "✅" if passed else "⚠️"
                 await add_jira_comment(target, f"{icon} QA {'통과' if passed else '이슈 발견'}: {outputs.get('summary', '')}")
-                if os.path.exists(video_path):
-                    await add_jira_attachment(target, video_path, filename=f"qa_recording_{video_ts}.mp4")
+                if video_version:
+                    await add_jira_remote_link(
+                        target,
+                        f"{PUBLIC_BASE_URL}/recordings/{project_id}/history/{video_version}",
+                        f"QA 녹화 (Sprint {pipeline.sprint})",
+                    )
             if stories:
                 story_list = _story_link_list(project_id, stories, "qa" if passed else "bug")
                 await broadcast({
@@ -982,6 +989,22 @@ def _stage_issue_target(project_id: str, story_key: str, stage: str) -> str:
     Jira만 보고는 단계별 진행 상황을 구분할 수 없었다."""
     subtasks = project_jira.get(project_id, {}).get("story_subtasks", {}).get(story_key, {})
     return subtasks.get(stage, story_key)
+
+
+def _archive_qa_recording(project_id: str, sprint: int, ts: str) -> str | None:
+    """이번 라운드 QA 녹화(qa_recording.mp4, 매 라운드 같은 경로에 덮어써짐)를
+    스프린트 태그가 붙은 이력 파일로 복사해서 남긴다 — design/history와 같은
+    패턴(publish_design 참고). 이게 없으면 지난 스프린트 영상은 다음 라운드가
+    시작되는 순간 덮어써져서 웹에서도 Jira 링크로도 다시 못 본다.
+    반환: "sprint3_20260818T120000" 같은 버전 문자열, 원본이 없으면 None."""
+    src = f"/workspace/{project_id}/qa_recording.mp4"
+    if not os.path.exists(src):
+        return None
+    hist_dir = f"/workspace/{project_id}/qa/history"
+    os.makedirs(hist_dir, exist_ok=True)
+    version = f"sprint{sprint}_{ts}"
+    shutil.copyfile(src, f"{hist_dir}/{version}.mp4")
+    return version
 
 
 def _existing_issues_context(project_id: str) -> list[dict]:
@@ -1926,6 +1949,19 @@ async def get_qa_recording(project_id: str, request: Request):
     return _serve_video_range(path, request.headers.get("range"))
 
 
+@app.get("/recordings/{project_id}/history/{version}")
+async def get_qa_recording_history(project_id: str, version: str, request: Request):
+    """_archive_qa_recording이 남긴 스프린트별 QA 녹화 이력을 서빙한다 — 최신
+    qa_recording.mp4와 달리 다음 라운드가 와도 덮어써지지 않는다. Jira
+    remotelink와 산출물 패널(collect_outputs)이 이 URL을 그대로 가리킨다."""
+    if "/" in version or ".." in version:
+        raise HTTPException(status_code=400, detail="잘못된 버전")
+    path = f"/workspace/{project_id}/qa/history/{version}.mp4"
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="녹화 영상이 없습니다")
+    return _serve_video_range(path, request.headers.get("range"))
+
+
 @app.get("/screenshots/{project_id}/{filename}")
 async def get_screenshot(project_id: str, filename: str):
     """QA(Firebase Test Lab)가 Robo 테스트 중 남긴 실제 기기 스크린샷을 서빙."""
@@ -1947,10 +1983,26 @@ def collect_outputs(base: str, project_id: str) -> list[dict]:
     video_path = f"{base}/qa_recording.mp4"
     if os.path.exists(video_path):
         items.append({
-            "type": "video", "label": "QA 동작 녹화", "icon": "🎥",
+            "type": "video", "label": "QA 동작 녹화 (최신)", "icon": "🎥",
             "url": f"/recordings/{project_id}",
             "mtime": os.path.getmtime(video_path),
         })
+
+    # 스프린트별 QA 녹화 이력(_archive_qa_recording) — 최신 qa_recording.mp4는
+    # 다음 라운드에 덮어써지지만, 이 파일들은 스프린트 태그가 붙어 계속 남는다.
+    video_hist_dir = f"{base}/qa/history"
+    if os.path.isdir(video_hist_dir):
+        for fname in os.listdir(video_hist_dir):
+            if not fname.endswith(".mp4"):
+                continue
+            version = fname[:-4]
+            m = re.match(r"^sprint(\d+)_", version)
+            label = f"QA 녹화 (Sprint {m.group(1)})" if m else f"QA 녹화 ({version})"
+            items.append({
+                "type": "video", "label": label, "icon": "🎥",
+                "url": f"/recordings/{project_id}/history/{version}",
+                "mtime": os.path.getmtime(f"{video_hist_dir}/{fname}"),
+            })
 
     shots_dir = f"{base}/.qa_screenshots"
     if os.path.isdir(shots_dir):
