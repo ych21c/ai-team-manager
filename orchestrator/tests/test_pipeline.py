@@ -191,6 +191,84 @@ def test_mark_completed_first_call_alone_sets_all_its_keys():
     assert p.stages["planning"].outputs == {"summary": "PRD", "requirements": ["a", "b"]}
 
 
+# ── 4b. agent_name과 함께 호출된 mark_completed — 전원 완료를 기다림 ──
+#
+# 오늘 발견된 레이스: design은 designer+architect 둘이 각자 stage_completed를
+# 보내는데, 먼저 끝난 쪽만으로 스테이지를 COMPLETED로 바꿔버려서 다음 게이트
+# (구현 시작 승인)가 나머지 에이전트를 기다리지 않고 열릴 수 있었다.
+# agent_name을 주면(main.py handle_agent_event의 실제 경로) stage.agents
+# 전원이 보고해야만 COMPLETED로 전이해야 한다.
+
+def test_partial_completion_with_agent_name_stays_running():
+    p = new_pipeline()
+    p.mark_running("design")
+    p.mark_completed("design", {"agent": "architect"}, agent_name="architect")
+    assert p.stages["design"].status == StageStatus.RUNNING
+    assert p.stages["design"].agents_done == ["architect"]
+
+
+def test_full_completion_with_agent_name_from_both_agents():
+    p = new_pipeline()
+    p.mark_running("design")
+    p.mark_completed("design", {"agent": "architect"}, agent_name="architect")
+    p.mark_completed("design", {"agent": "designer"}, agent_name="designer")
+    assert p.stages["design"].status == StageStatus.COMPLETED
+    assert set(p.stages["design"].agents_done) == {"architect", "designer"}
+
+
+def test_same_agent_reporting_twice_does_not_fake_full_completion():
+    """같은 에이전트가 실수로 두 번 보고해도(재전달 등) 나머지 에이전트가
+    아직이면 여전히 COMPLETED가 되면 안 된다."""
+    p = new_pipeline()
+    p.mark_running("design")
+    p.mark_completed("design", {}, agent_name="architect")
+    p.mark_completed("design", {}, agent_name="architect")
+    assert p.stages["design"].status == StageStatus.RUNNING
+    assert p.stages["design"].agents_done == ["architect"]
+
+
+def test_single_agent_stage_completes_immediately_even_with_agent_name():
+    """agents가 1개뿐인 스테이지(pm/implement/qa/...)는 agent_name을 줘도
+    그 하나로 바로 전원 완료 조건을 만족해야 한다 — 이 스테이지들의 동작은
+    바뀌면 안 된다."""
+    p = new_pipeline()
+    p.mark_running("planning")
+    p.mark_completed("planning", {"summary": "PRD"}, agent_name="pm")
+    assert p.stages["planning"].status == StageStatus.COMPLETED
+
+
+def test_mark_completed_without_agent_name_still_completes_immediately():
+    """agent_name을 안 주면(테스트 세팅 등 기존 호출 관례) 예전처럼 즉시
+    COMPLETED로 전이해야 한다 — 이 저장소의 다른 테스트 다수가 이 관례에
+    의존하므로 하위 호환이 깨지면 안 된다."""
+    p = new_pipeline()
+    p.mark_completed("design", {"agent": "architect"})
+    assert p.stages["design"].status == StageStatus.COMPLETED
+
+
+def test_mark_running_resets_agents_done_for_a_new_round():
+    """재작업으로 design이 다시 도는데 이전 라운드에 이미 완료 보고했던
+    에이전트 이름이 남아있으면, 이번 라운드엔 그 에이전트가 실제로 다시
+    끝나지 않았는데도 "이미 끝남" 취급돼 스테이지가 조기 완료될 수 있다."""
+    p = new_pipeline()
+    p.mark_running("design")
+    p.mark_completed("design", {}, agent_name="architect")
+    assert p.stages["design"].agents_done == ["architect"]
+
+    p.mark_running("design")  # 재작업으로 다시 시작
+    assert p.stages["design"].agents_done == []
+    p.mark_completed("design", {}, agent_name="designer")
+    assert p.stages["design"].status == StageStatus.RUNNING  # architect가 아직 이번 라운드엔 안 끝남
+
+
+def test_summary_includes_agents_done_for_persistence():
+    p = new_pipeline()
+    p.mark_running("design")
+    p.mark_completed("design", {}, agent_name="architect")
+    data = p.summary()
+    assert data["stages"]["design"]["agents_done"] == ["architect"]
+
+
 # ── 5. 실패 처리 — 이후 스테이지가 절대 진행되지 않아야 함 ──────────
 
 def test_mark_failed_blocks_downstream_forever():

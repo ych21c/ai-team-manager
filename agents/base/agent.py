@@ -125,6 +125,24 @@ def build_summary(full_response: str, agent_name: str) -> str:
     아예 자르지 않는다 — summary는 항상 full_response 그대로."""
     return full_response
 
+
+def role_summary_fields(agent_name: str, summary: str, design_preview: bool = False) -> dict:
+    """design 스테이지의 designer/architect가 서로 다른 outputs 키에 요약을
+    쓰게 분리한다. 둘 다 "summary"에 쓰면 Pipeline.mark_completed의 shallow
+    merge 때문에 나중에 끝나는 쪽이 먼저 쪽 산출물을 지워버린다 — 실제로 QA의
+    design_qa_check가 "Designer 스펙"으로 읽는 필드가 architect의 기술 스펙
+    텍스트로 바뀌는 사고로 이어졌다. 그래서 architect는 "summary"를 아예 안
+    쓰고 "architecture_summary"만 쓰며, "design_preview"도 같은 이유로
+    designer만 보낸다(architect가 매번 False를 보내면 designer가 만든 True를
+    덮어씀)."""
+    if agent_name == "architect":
+        return {"architecture_summary": summary}
+    fields = {"summary": summary}
+    if agent_name == "designer":
+        fields["design_summary"] = summary
+        fields["design_preview"] = design_preview
+    return fields
+
 # ── 소스코드 구조 (자가 개선 모드에서만 사용) ────────────────────────
 SOURCE_CONTEXT = """
 ## AI Team Manager 소스코드
@@ -173,9 +191,33 @@ key/title 목록)가 있으면, 이번 재기획에서 그 항목들을 requirem
    key를 정확히 그대로 쓰세요(제목을 새로 짓지 마세요).""",
 
     "architect": """당신은 AI Team Manager의 Software Architect입니다.
-역할: 시스템 아키텍처, API 스펙, 데이터 모델 설계.
-산출물: /workspace/{project_id}/architecture.md
-출력: JSON { "tech_stack": {...}, "api_spec": [...], "data_models": [...] }""",
+역할: 좋은 코드 설계 원칙(단일 책임, 적절한 결합도/응집도, 필요 이상으로
+추상화하지 않기)에 따라 구조를 잡고, implement가 그 구조를 그대로 따라
+구현할 수 있는 수준까지 구체화합니다.
+
+요구사항의 실제 스코프에 맞게 설계하세요 — 화면 한두 개짜리 단순 앱에
+레이어드 아키텍처/DI 컨테이너/불필요한 인터페이스 계층을 욱여넣지 말고,
+반대로 여러 도메인·화면이 얽힌 앱을 파일 하나에 다 몰아넣지도 마세요.
+requirements/milestones에 나온 기능 개수와 앞으로 늘어날 여지를 보고,
+그 규모에 맞는 만큼만 구조화하세요 — 과설계도 저설계도 둘 다 실패입니다.
+
+module_structure는 implement가 그대로 따라 만들 수 있을 만큼 구체적으로
+쓰세요(폴더/파일 단위, 각자의 책임, 무엇에 의존하는지). 화면/기능이 늘어날 걸
+대비해 어디를 나누고 어디는 합쳐도 되는지까지 판단해서 넘기는 게 이 역할의
+핵심입니다 — "tech_stack만 정해주고 나머지는 implement가 알아서"가 되면
+안 됩니다.
+
+산출물: /workspace/{project_id}/architect_output.md
+반드시 아래를 모두 포함한 JSON으로 출력하세요:
+{
+  "tech_stack": {...},
+  "module_structure": [
+    {"path": "lib/features/counter/counter_screen.dart", "responsibility": "...", "depends_on": [...]}
+  ],
+  "api_spec": [...],
+  "data_models": [...],
+  "scope_rationale": "이 구조 수준을 선택한 이유 — requirements 규모 대비 과설계/저설계가 아닌 근거"
+}""",
 
     "qa": """당신은 AI Team Manager의 QA Engineer입니다.
 역할: 테스트 케이스 작성, 버그 리포트.
@@ -656,7 +698,6 @@ async def process_task(r: aioredis.Redis, task: dict):
     summary = build_summary(full_response, AGENT_NAME)
     outputs = {
         "agent":        AGENT_NAME,
-        "summary":      summary,
         "self_improve": project_id == "self-improve",
         "input_tokens":  total_input_tokens,
         "output_tokens": total_output_tokens,
@@ -668,12 +709,7 @@ async def process_task(r: aioredis.Redis, task: dict):
     cost = _cost_usd(MODEL, total_input_tokens, total_output_tokens)
     if cost is not None:
         outputs["cost_usd"] = cost
-    # design 스테이지는 designer+architect 둘이 같은 stage_completed를 보내고
-    # orchestrator가 outputs를 merge한다 — architect도 매번 "design_preview": False를
-    # 보내면 나중에 끝나는 쪽이 designer가 만든 True를 덮어써버린다. designer가
-    # 아닐 땐 이 키 자체를 안 보내서 merge 시 서로 안 건드리게 한다.
-    if AGENT_NAME == "designer":
-        outputs["design_preview"] = design_preview
+    outputs.update(role_summary_fields(AGENT_NAME, summary, design_preview))
 
     await emit(r, {
         "type": "stage_completed",
