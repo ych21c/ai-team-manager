@@ -184,7 +184,7 @@ def _load_all_projects():
             print(f"[state] {fname} 로드 실패: {e}")
             continue
 
-        pipeline = Pipeline(pid, data.get("instruction", ""))
+        pipeline = Pipeline(pid, data.get("instruction", ""), sprint=data.get("sprint", 1))
         for stage_name, stage_data in (data.get("stages") or {}).items():
             if stage_name not in pipeline.stages:
                 continue
@@ -345,7 +345,7 @@ async def handle_agent_event(event: dict):
                     )
                     await broadcast({
                         "type": "agent_message", "project_id": project_id, "agent": "system",
-                        "content": f"📋 기존 Epic({existing['epic']}: {pname}) 아래 신규 이슈 {len(new_records)}건 생성\n{lines}",
+                        "content": f"📋 [Sprint {pipeline.sprint}] 기존 Epic({existing['epic']}: {pname}) 아래 신규 이슈 {len(new_records)}건 생성\n{lines}",
                     })
                 else:
                     await broadcast({
@@ -360,7 +360,7 @@ async def handle_agent_event(event: dict):
                     await broadcast({
                         "type": "agent_message", "project_id": project_id, "agent": "system",
                         "content": (
-                            f"📋 Jira 등록 완료\n"
+                            f"📋 [Sprint {pipeline.sprint}] Jira 등록 완료\n"
                             f"• Epic: [spec] [{atlassian['epic']}: {pname}]({atlassian['jira_url']})\n"
                             f"• Stories: {story_list}"
                         ),
@@ -708,9 +708,10 @@ async def _create_ad_hoc_jira_story(project_id: str, title: str) -> str | None:
     key = records[0]["key"]
     jira.setdefault("stories", []).append(key)
     jira.setdefault("story_titles", {})[key] = records[0]["title"]
+    sprint = projects[project_id].sprint if project_id in projects else 1
     await broadcast({
         "type": "agent_message", "project_id": project_id, "agent": "system",
-        "content": f"📋 새 Jira 이슈 생성: {_story_link(project_id, key, 'spec')}",
+        "content": f"📋 [Sprint {sprint}] 새 Jira 이슈 생성: {_story_link(project_id, key, 'spec')}",
     })
     return key
 
@@ -856,7 +857,13 @@ async def _retry_planning_with_feedback(
     (완전히 다른 요구사항으로 바뀌는 경우), False면 기존 PRD에 이번 변경사항만
     덧붙인다(기존 범위 안에서 특정 요청/이슈 하나만 바뀌는 경우). jira_issue가
     있으면 어떤 이슈에 대한 변경인지 추적할 수 있게 해당 스토리에도 코멘트를
-    남긴다(planning 완료 후 붙는 Epic 코멘트와는 별개)."""
+    남긴다(planning 완료 후 붙는 Epic 코멘트와는 별개).
+
+    이 시점이 "전체 파이프라인 실행 회차"가 바뀌는 유일한 지점이라 pipeline.sprint를
+    여기서 증가시킨다 — 이후 이번 라운드에서 새로 생성되는 이슈/디자인 산출물에
+    Sprint 번호를 태그로 붙여서, mtime만으로 짐작하던 "이번 라운드 결과물"을
+    명시적으로 구분할 수 있게 한다."""
+    pipeline.sprint += 1
     for name in ("planning", "design", "implement", "qa", "autotest", "release"):
         pipeline.stages[name].status = StageStatus.PENDING
         pipeline.stages[name].outputs = {}
@@ -1541,10 +1548,11 @@ async def publish_design(project_id: str, body: DesignPublish):
     머지 실패 시 pending에 그대로 남아 '적용 전'으로 계속 보인다."""
     workspace = f"/workspace/{project_id}"
     scenarios = [k for k in body.scenarios if _safe_design_key(k)]
+    sprint = projects[project_id].sprint if project_id in projects else 1
 
     pr_number = await create_pull_request(
         body.github_repo, body.branch,
-        title=f"design: {project_id} 목업 갱신",
+        title=f"[sprint {sprint}] design: {project_id} 목업 갱신",
         body=f"시나리오: {', '.join(scenarios) or '(없음)'}",
     )
     if pr_number is None:
@@ -1560,6 +1568,7 @@ async def publish_design(project_id: str, body: DesignPublish):
         pending_dir = f"{workspace}/design/pending"
         os.makedirs(applied_dir, exist_ok=True)
         ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+        version = f"sprint{sprint}_{ts}"
         applied_count = 0
         # 목업이 적용될 때마다 그 시나리오(=Jira 이슈 키)에 링크를 코멘트로 남긴다 —
         # 산출물을 앱 안에서만 보여주면 이 라운드가 최신본으로 덮어써질 때 이전
@@ -1581,15 +1590,15 @@ async def publish_design(project_id: str, body: DesignPublish):
                 f.write(content)
             hist_dir = f"{workspace}/design/history/{key}"
             os.makedirs(hist_dir, exist_ok=True)
-            with open(f"{hist_dir}/{ts}.html", "w") as f:
+            with open(f"{hist_dir}/{version}.html", "w") as f:
                 f.write(content)
             os.remove(src)
             applied_count += 1
             if key in commentable:
                 await add_jira_comment(key, (
-                    f"🎨 디자인 목업 반영 (버전 {ts})\n"
+                    f"🎨 디자인 목업 반영 (Sprint {sprint} · 버전 {ts})\n"
                     f"최신: {PUBLIC_BASE_URL}/design-file/{project_id}/applied/{key}\n"
-                    f"이 버전: {PUBLIC_BASE_URL}/design-file/{project_id}/history/{key}/{ts}"
+                    f"이 버전: {PUBLIC_BASE_URL}/design-file/{project_id}/history/{key}/{version}"
                 ))
         await broadcast({
             "type": "agent_message", "project_id": project_id, "agent": "system",
