@@ -146,6 +146,10 @@ requirements는 기능/수용 기준 중심으로 작성하세요. 컬러, 패�
 시각적 디자인 디테일은 명시하지 마세요 — 그건 designer가 정할 몫입니다
 (브랜드 컬러 같은 것도 아직 없으면 designer가 처음 정하거나, 없는 채로
 진행하고 다음 스프린트에 정하면 됩니다).
+프롬프트의 context에 "existing_issues"(이미 Jira 이슈로 만들어진 항목의
+key/title 목록)가 있으면, 이번 재기획에서 그 항목들을 requirements에 다시
+쓰지 마세요 — 이미 이슈화된 요구사항입니다. requirements에는 그 목록에 없는,
+이번에 새로 필요해진 요구사항만 나열하세요.
 산출물: /workspace/{project_id}/prd.md
 출력: JSON { "summary": "...", "requirements": [...], "milestones": [...] }""",
 

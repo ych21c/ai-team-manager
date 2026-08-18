@@ -676,12 +676,9 @@ async def _dispatch_chat_triage(pipeline: Pipeline, user_message: str):
     # 기존 Jira 이슈(시나리오) 목록을 넘겨서, PM이 이번 요청이 그 중 하나를
     # 고치는 건지 완전히 새로운 화면/기능인지 판단할 수 있게 한다 — 이게 있어야
     # 재작업을 "이슈 하나"로 좁히거나 새 이슈를 만들지 판단 가능.
-    jira = project_jira.get(pid, {})
-    if jira.get("stories"):
-        story_titles = jira.get("story_titles", {})
-        context["existing_issues"] = [
-            {"key": key, "title": story_titles.get(key, key)} for key in jira["stories"]
-        ]
+    existing_issues = _existing_issues_context(pid)
+    if existing_issues:
+        context["existing_issues"] = existing_issues
     await redis.send_task("pm", pid, {
         "project_id": pid,
         "stage": "chat_triage",
@@ -959,6 +956,19 @@ async def _retry_implement_with_feedback(pipeline: Pipeline, feedback: str, scen
     })
 
 
+def _existing_issues_context(project_id: str) -> list[dict]:
+    """이 프로젝트에 이미 만들어진 Jira 스토리 목록을 [{"key","title"}, ...]로 반환.
+    PM이 재기획(planning 재실행)이나 채팅 트리아지를 할 때 이미 있는 이슈를 보고
+    판단할 수 있게 넘기는 용도 — 안 보이면 매 스프린트 같은 요구사항을 다른 문구로
+    다시 써서 _sync_new_requirements_to_epic의 텍스트 기반 dedup을 통과해 중복
+    이슈가 쌓이는 문제가 있었다."""
+    jira = project_jira.get(project_id, {})
+    if not jira.get("stories"):
+        return []
+    story_titles = jira.get("story_titles", {})
+    return [{"key": key, "title": story_titles.get(key, key)} for key in jira["stories"]]
+
+
 def _completed_context(pipeline: Pipeline) -> dict:
     """완료된 모든 스테이지의 outputs를 스테이지명으로 묶어 다음 태스크 context로
     쓴다 — advance_pipeline(main.py:899-906 부근)이 쓰는 것과 같은 구성."""
@@ -1096,6 +1106,14 @@ async def advance_pipeline(pipeline: Pipeline):
         # 레포 정보를 context에 포함 → Implement Agent가 활용
         if project_repos.get(pipeline.project_id):
             context["github_repo"] = project_repos[pipeline.project_id]
+
+        # planning(PM) 재실행 시 이미 만들어둔 Jira 이슈를 보여준다 — 안 보이면 PM이
+        # 매 스프린트 같은 요구사항을 다른 문구로 다시 써서, 텍스트 기반 dedup
+        # (_sync_new_requirements_to_epic)을 통과해 중복 이슈가 쌓인다.
+        if stage.name == "planning":
+            existing_issues = _existing_issues_context(pipeline.project_id)
+            if existing_issues:
+                context["existing_issues"] = existing_issues
 
         # design 스테이지는 Jira 스토리 단위로 목업을 나눠 만들어야 하므로 시나리오
         # 목록을 넘긴다. Jira 연동이 꺼져 있거나 스토리가 없으면 "main" 시나리오
