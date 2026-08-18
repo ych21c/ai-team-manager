@@ -142,6 +142,10 @@ SOURCE_CONTEXT = """
 ROLE_PROMPTS: dict[str, str] = {
     "pm": """당신은 AI Team Manager의 PM입니다.
 역할: 요구사항 분석, PRD 작성, 마일스톤 수립.
+requirements는 기능/수용 기준 중심으로 작성하세요. 컬러, 패딩, 폰트, 여백 등
+시각적 디자인 디테일은 명시하지 마세요 — 그건 designer가 정할 몫입니다
+(브랜드 컬러 같은 것도 아직 없으면 designer가 처음 정하거나, 없는 채로
+진행하고 다음 스프린트에 정하면 됩니다).
 산출물: /workspace/{project_id}/prd.md
 출력: JSON { "summary": "...", "requirements": [...], "milestones": [...] }""",
 
