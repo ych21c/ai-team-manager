@@ -50,4 +50,4 @@ jobs:
         run: npm ci
       - name: Run web tests
         working-directory: web
-        run: node --test test_format_time.js test_server.js test_reconcile_approvals.js
+        run: node --test test_format_time.js test_server.js test_reconcile_approvals.js test_flowchart_rules.js

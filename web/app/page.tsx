@@ -3,6 +3,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import type { CSSProperties } from "react";
 import { reconcileApprovals } from "./reconcileApprovals";
 import { formatMessageTime } from "./formatTime";
+import { canDiscardStage } from "./flowchartRules";
 
 // ── 타입 ──────────────────────────────────────────────────────────
 type AgentStatus = "pending" | "running" | "completed" | "failed" | "waiting_approval";
@@ -523,9 +524,6 @@ const STAGE_DEPENDS_ON: Partial<Record<StageName, StageName>> = {
 // requires_approval과 동일해야 함) — design/autotest는 이번에 새로 추가된 게이트,
 // implement/release는 기존 게이트.
 const GATED_STAGES = new Set<StageName>(["design", "implement", "autotest", "release"]);
-// planning은 "이전 단계"가 없어서 폐기 대상이 아니다(orchestrator/main.py의
-// _DISCARDABLE_STAGES와 동일해야 함).
-const DISCARDABLE_STAGES = new Set<StageName>(["design", "implement", "qa", "autotest", "release"]);
 const STAGE_META: Record<StageName, { label: string; agents: string[] }> = {
   planning:  { label: "PM",        agents: ["pm"] },
   design:    { label: "Design",    agents: ["designer", "architect"] },
@@ -643,7 +641,7 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
   // 되돌릴 수 있어야 한다 — 게이트 결정 블록은 "지금 막 도달한 게이트"에서만
   // 잠깐 보이고 사라지므로 그것만으론 부족하다.
   const showInlineRerun = status === "completed";
-  const canDiscard = DISCARDABLE_STAGES.has(name) && status === "completed";
+  const canDiscard = canDiscardStage(name, status);
   const isInlineEditing = !!editing[name];
 
   const handleDiscard = () => {
