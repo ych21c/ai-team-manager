@@ -523,6 +523,9 @@ const STAGE_DEPENDS_ON: Partial<Record<StageName, StageName>> = {
 // requires_approval과 동일해야 함) — design/autotest는 이번에 새로 추가된 게이트,
 // implement/release는 기존 게이트.
 const GATED_STAGES = new Set<StageName>(["design", "implement", "autotest", "release"]);
+// planning은 "이전 단계"가 없어서 폐기 대상이 아니다(orchestrator/main.py의
+// _DISCARDABLE_STAGES와 동일해야 함).
+const DISCARDABLE_STAGES = new Set<StageName>(["design", "implement", "qa", "autotest", "release"]);
 const STAGE_META: Record<StageName, { label: string; agents: string[] }> = {
   planning:  { label: "PM",        agents: ["pm"] },
   design:    { label: "Design",    agents: ["designer", "architect"] },
@@ -622,22 +625,31 @@ function DecisionBlock({ editTarget, gateTarget, stages, draft, setDraft, editin
 }
 
 function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpand, onOpenDesign,
-                    editing, onStartEdit, draft, setDraft, busy, onRun }: {
+                    editing, onStartEdit, onCancelEdit, draft, setDraft, busy, onRun, onDiscard }: {
   name: StageName; stageInfo?: StageInfo; projectId: string; isActive: boolean;
   expanded: boolean; onToggleExpand: () => void; onOpenDesign: () => void;
-  editing: Record<string, boolean>; onStartEdit: (stage: string) => void;
+  editing: Record<string, boolean>; onStartEdit: (stage: string) => void; onCancelEdit: (stage: string) => void;
   draft: Record<string, string>;
   setDraft: (fn: (d: Record<string, string>) => Record<string, string>) => void;
   busy: Record<string, boolean>; onRun: (stage: string, feedback: string) => void;
+  onDiscard: (stage: string) => void;
 }) {
   const meta = STAGE_META[name];
   const agentMeta = AGENT_META[meta.agents[0]] ?? { label: meta.label, color: "#666", bg: "#f0f0f0" };
   const status = (stageInfo?.status ?? "pending") as AgentStatus;
   const outputs = stageInfo?.outputs;
-  // implement는 뒤(qa)에 게이트가 없어서 별도 결정 블록을 못 타므로, 완료된 뒤에도
-  // 직접 다시 돌릴 수 있는 인라인 재실행을 노드 자체에 둔다.
-  const showInlineRerun = name === "implement" && status === "completed";
+  // 완료된 스테이지는 게이트가 지나갔어도(혹은 애초에 게이트가 없어도 — qa처럼)
+  // 노드에서 바로 같은 입력으로 재실행하거나, 산출물을 폐기하고 이전 단계로
+  // 되돌릴 수 있어야 한다 — 게이트 결정 블록은 "지금 막 도달한 게이트"에서만
+  // 잠깐 보이고 사라지므로 그것만으론 부족하다.
+  const showInlineRerun = status === "completed";
+  const canDiscard = DISCARDABLE_STAGES.has(name) && status === "completed";
   const isInlineEditing = !!editing[name];
+
+  const handleDiscard = () => {
+    if (!window.confirm(`'${meta.label}' 산출물을 폐기하고 이전 단계로 되돌릴까요? 이후 단계 산출물도 함께 사라집니다.`)) return;
+    onDiscard(name);
+  };
 
   return (
     <div style={{
@@ -686,15 +698,25 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
             isInlineEditing ? (
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 <textarea value={draft[name] ?? ""} onChange={e => setDraft(d => ({ ...d, [name]: e.target.value }))}
-                  rows={2} placeholder="재작업 요청 내용" style={{ width: "100%", padding: "6px 8px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12, fontFamily: "inherit", boxSizing: "border-box" }} />
-                <button onClick={() => onRun(name, draft[name] ?? "")} disabled={busy[name]}
-                  style={{ ...flowBtnStyle, alignSelf: "flex-start", background: "#7F77DD", border: "none", color: "#fff" }}>
-                  {busy[name] ? "실행 중..." : "▶ Run"}
-                </button>
+                  rows={2} placeholder="재작업 요청 내용 (비워두면 같은 입력으로 재실행)" style={{ width: "100%", padding: "6px 8px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12, fontFamily: "inherit", boxSizing: "border-box" }} />
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button onClick={() => onCancelEdit(name)}
+                    style={{ ...flowBtnStyle, background: "#f5f4f0", color: "#666" }}>취소</button>
+                  <button onClick={() => onRun(name, draft[name] ?? "")} disabled={busy[name]}
+                    style={{ ...flowBtnStyle, background: "#7F77DD", border: "none", color: "#fff" }}>
+                    {busy[name] ? "실행 중..." : "▶ Run"}
+                  </button>
+                </div>
               </div>
             ) : (
-              <button onClick={() => onStartEdit(name)}
-                style={{ ...flowBtnStyle, alignSelf: "flex-start", background: "#fff", color: "#666" }}>🔁 다시 실행</button>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={() => onStartEdit(name)}
+                  style={{ ...flowBtnStyle, background: "#fff", color: "#666" }}>🔁 재실행</button>
+                {canDiscard && (
+                  <button onClick={handleDiscard} disabled={busy[name]}
+                    style={{ ...flowBtnStyle, background: "#FCEBEB", borderColor: "#F0C6C6", color: "#A32D2D" }}>폐기</button>
+                )}
+              </div>
             )
           )}
         </div>
@@ -783,8 +805,9 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
               expanded={isExpanded(name)} onToggleExpand={() => setExpanded(v => ({ ...v, [name]: !isExpanded(name) }))}
               onOpenDesign={onOpenDesign}
               editing={editing} onStartEdit={n => setEditing(v => ({ ...v, [n]: true }))}
+              onCancelEdit={n => setEditing(v => ({ ...v, [n]: false }))}
               draft={draft} setDraft={setDraft} busy={busy}
-              onRun={runStage}
+              onRun={runStage} onDiscard={discardStage}
             />
             {next && (
               showGate ? (
