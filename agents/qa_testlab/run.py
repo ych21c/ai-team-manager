@@ -650,6 +650,33 @@ _VERIFY_SCENARIOS_RULES = """당신은 Flutter QA 엔지니어입니다. 이 sys
   이런 화면에서는 `tester.pump(Duration(...))`로 정확히 원하는 시간만큼만 프레임을
   진행시키세요. 화면이 전환된 뒤(반복 애니메이션이 dispose된 뒤)에는 다시 pumpAndSettle을
   써도 됩니다.
+- 애니메이션이 끝난 뒤 실제 비동기 초기화(로컬 DB 오픈, 알림 서비스 초기화 등)까지 끝나야
+  다음 화면으로 넘어가는 스플래시류 화면에서는, `tester.pump(Duration(seconds: 3))`처럼
+  한 번에 큰 Duration을 pump하지 마세요 — 이런 단발 pump는 프레임/마이크로태스크를 딱 한
+  번만 진행시켜서, 애니메이션 이후에 걸린 비동기 체인이 그 한 번 안에 다 안 풀려 화면이
+  전환되기 "전" 상태로 남아있는 게 실측으로 확인됐습니다(recoveryfit에서 실제 재현: 3초를
+  pump해도 여전히 스플래시 화면). 대신 아래처럼 작게 나눠서 여러 번 pump하며 목표 화면의
+  텍스트/위젯이 나타날 때까지 기다리세요:
+  ```dart
+  Future<void> pumpUntilFound(WidgetTester tester, Finder finder, {int maxTries = 10}) async {
+    for (var i = 0; i < maxTries; i++) {
+      await tester.pump(const Duration(milliseconds: 500));
+      if (finder.evaluate().isNotEmpty) return;
+    }
+  }
+  ```
+- 화면 이름을 확인할 때 `find.byType(SplashScreen)`, `find.byType(LandingScreen)`처럼
+  이 프로젝트 고유의 화면/위젯 클래스를 참조하지 마세요 — 그 클래스가 정의된 파일을
+  import하지 않았으면(이 테스트는 main.dart만 import합니다) 컴파일이 즉시 실패합니다.
+  화면 식별은 항상 `find.text(...)`, `find.byIcon(...)`처럼 그 화면에만 있는 문구/아이콘으로
+  하세요. `Scaffold`, `MaterialApp`, `ElevatedButton`, `FloatingActionButton`처럼 이미 import된
+  flutter/material.dart의 표준 위젯 타입은 `find.byType(...)`에 써도 됩니다.
+- 헤드라인/라벨처럼 줄바꿈이 있는 텍스트를 검증할 때, 실제 소스 코드를 보고 그 문구가
+  한 `Text` 위젯 안에 `\\n`으로 들어있는지 아니면 여러 줄이 별도의 `Text` 위젯으로 나뉘어
+  있는지 반드시 확인하세요. 소스에 `Text('첫째줄')`과 `Text('둘째줄')`처럼 위젯이 나뉘어
+  있는데 테스트에서 `find.text('첫째줄\\n둘째줄')`처럼 합친 문자열로 찾으면 항상
+  `findsNothing`으로 실패합니다(recoveryfit에서 실제 재현) — 그럴 땐 각 줄을 따로
+  `find.text('첫째줄')`, `find.text('둘째줄')`로 검증하세요.
 - 다른 설명 없이, 파일 전체를 ```dart 코드 블록 하나 안에만 출력하세요."""
 
 
