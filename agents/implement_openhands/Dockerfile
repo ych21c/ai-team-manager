@@ -19,6 +19,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN uv pip install --system --break-system-packages --no-cache -r requirements.txt
 
-COPY run.py git_workspace.py prompt_helpers.py build_apk.py .
+COPY run.py git_workspace.py prompt_helpers.py build_apk.py ./
 
 CMD ["python3", "run.py"]
