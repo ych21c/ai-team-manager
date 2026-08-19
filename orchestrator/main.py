@@ -1904,6 +1904,7 @@ async def retry_implement(project_id: str, body: RetryFeedback):
     p = projects.get(project_id)
     if not p:
         raise HTTPException(404)
+    await _add_history(project_id, f"🔁 QA 재작업 요청 (수동, retry 예산 소진 후 개입): {body.feedback}")
     await _retry_implement_with_feedback(p, body.feedback, [body.scenario_key] if body.scenario_key else None)
     return {"ok": True}
 
