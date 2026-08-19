@@ -109,10 +109,34 @@ def _extract_job_id(html_url: str) -> str | None:
     return m.group(1) if m else None
 
 
+_ISSUE_LINE_RE = re.compile(r"error|warning|exception|failed", re.IGNORECASE)
+_CONTEXT_LINES_AFTER = 2       # Expected/Actual 같은 어설션 diff가 매칭 줄 바로 다음에 오는 경우가 많아서 몇 줄 더 챙긴다.
+_MAX_FILTERED_CHARS = 3000
+
+
+def _extract_issue_lines(log_text: str) -> str:
+    """CI 원본 로그(setup/캐시/아티팩트 업로드 등 실제 원인과 무관한 줄이 대부분)에서
+    error/warning/실패 관련 줄만 골라낸다 — flutter analyze의 "error • .../warning • ...",
+    flutter test의 "... FAILED", GitHub Actions 자체 주석(##[error]/##[warning])을
+    모두 잡아낸다. 매칭 줄 뒤로 몇 줄을 더 남겨서 Expected/Actual 같은 어설션 diff가
+    잘려나가지 않게 한다. 예전엔 로그 끝 2000자를 그냥 잘라 썼는데, flutter test는
+    실패 원인이 나온 뒤에도 요약/cleanup 출력이 이어져서 정작 원인 줄이 잘려나가고
+    무관한 텍스트만 Implement 재작업 프롬프트의 토큰으로 들어가는 문제가 있었다."""
+    lines = log_text.splitlines()
+    keep = [False] * len(lines)
+    for i, line in enumerate(lines):
+        if _ISSUE_LINE_RE.search(line):
+            for j in range(i, min(i + 1 + _CONTEXT_LINES_AFTER, len(lines))):
+                keep[j] = True
+    filtered = "\n".join(line for line, k in zip(lines, keep) if k)
+    return filtered[-_MAX_FILTERED_CHARS:]
+
+
 async def fetch_failure_detail(client: httpx.AsyncClient, repo: str, sha: str) -> str:
-    """실패한 체크런의 실제 로그 마지막 부분을 가져온다 — "실패한 체크: analyze-and-test"
-    라는 요약만으로는 Implement가 뭘 고쳐야 하는지 알 수 없어서, 재작업 피드백에
-    실제 에러 메시지를 실어 보내기 위함."""
+    """실패한 체크런의 실제 로그에서 에러/경고 줄만 가져온다 — "실패한 체크:
+    analyze-and-test"라는 요약만으로는 Implement가 뭘 고쳐야 하는지 알 수 없어서,
+    재작업 피드백에 실제 에러 메시지를 실어 보내기 위함. 필터링된 결과가 비어있으면
+    (예상 못 한 로그 포맷) 기존처럼 로그 끝 2000자로 폴백한다."""
     try:
         r = await client.get(
             f"https://api.github.com/repos/{repo}/commits/{sha}/check-runs",
@@ -131,7 +155,7 @@ async def fetch_failure_detail(client: httpx.AsyncClient, repo: str, sha: str) -
         )
         if log_r.status_code != 200:
             return ""
-        return log_r.text[-2000:]
+        return _extract_issue_lines(log_r.text) or log_r.text[-2000:]
     except Exception as e:
         print(f"[autotest] 실패 로그 조회 실패: {e}")
         return ""

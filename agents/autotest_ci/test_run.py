@@ -11,7 +11,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("GITHUB_TOKEN", "x")
 
-from run import _pick_failed_run, _extract_job_id, _find_upstream
+from run import _pick_failed_run, _extract_job_id, _find_upstream, _extract_issue_lines
 
 
 def test_pick_failed_run_finds_failure_conclusion():
@@ -61,3 +61,46 @@ def test_find_upstream_prefers_implement_over_stale_autotest():
 def test_find_upstream_falls_back_when_no_implement():
     context = {"autotest": {"branch": "only-option"}}
     assert _find_upstream(context, "branch") == "only-option"
+
+
+def test_extract_issue_lines_keeps_analyzer_error_drops_noise():
+    """예전 버그: 로그 끝 2000자만 자르면 flutter analyze 에러가 설치/캐시 로그
+    뒤에 묻혀 잘려나갔다. error/warning 줄과 그 문맥만 남아야 한다."""
+    log = "\n".join([
+        "2024-01-01T00:00:00Z Run flutter pub get",
+        "2024-01-01T00:00:00Z Resolving dependencies...",
+        "2024-01-01T00:00:00Z Downloading packages...",
+        "2024-01-01T00:00:00Z Analyzing project...",
+        "  error • lib/main.dart:10:5 • Undefined name 'foo' • undefined_identifier",
+        "2024-01-01T00:00:00Z 1 issue found.",
+        "2024-01-01T00:00:00Z Post job cleanup.",
+        "2024-01-01T00:00:00Z Saving cache...",
+    ])
+    filtered = _extract_issue_lines(log)
+    assert "Undefined name 'foo'" in filtered
+    assert "Resolving dependencies" not in filtered
+    assert "Saving cache" not in filtered
+
+
+def test_extract_issue_lines_keeps_context_after_test_failure():
+    """flutter test FAILED 줄 뒤에 오는 Expected/Actual 어설션 diff는 그 줄 자체엔
+    'error'/'warning' 키워드가 없어도 원인 파악에 필수라 문맥으로 같이 남아야 한다."""
+    log = "\n".join([
+        "00:03 +5 -1: widget test FAILED",
+        "Expected: true",
+        "  Actual: <false>",
+        "2024-01-01T00:00:00Z Process completed with exit code 1.",
+    ])
+    filtered = _extract_issue_lines(log)
+    assert "Expected: true" in filtered
+    assert "Actual: <false>" in filtered
+
+
+def test_extract_issue_lines_empty_when_no_match():
+    assert _extract_issue_lines("all good, nothing to see here\nstill fine") == ""
+
+
+def test_extract_issue_lines_caps_length_for_very_noisy_logs():
+    noisy = "\n".join(f"error • lib/f{i}.dart:1:1 • something wrong • rule_{i}" for i in range(500))
+    filtered = _extract_issue_lines(noisy)
+    assert len(filtered) <= 3000
