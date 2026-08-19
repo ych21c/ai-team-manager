@@ -109,6 +109,72 @@ async def test_discard_planning_is_rejected(monkeypatch):
     assert p.stages["planning"].status == StageStatus.COMPLETED  # 건드려지지 않았어야 함
 
 
+# ── discard_stage("취소") — 실행 중(running)인 스테이지, 에이전트 일부만 완료 ──
+# recoveryfit에서 실제 재현된 사고: design(designer+architect)에서 architect는
+# 이미 끝났고 designer만 아직 안 끝난 채로 "취소"를 누르면, 재승인 후 architect
+# 결과물까지 날아가고 처음부터 다시 돌았다. _cancel_running_stage가 architect의
+# outputs/agents_done을 보존하고, advance_pipeline이 재승인 시 designer한테만
+# 새 태스크를 보내는지 확인한다.
+
+def _project_with_design_partially_done(pid: str = "p1") -> Pipeline:
+    p = Pipeline(pid, "PRD 원본")
+    p.mark_completed("planning", {"summary": "기획 완료"})
+    p.stages["design"].approved = True
+    p.mark_running("design")
+    p.mark_completed("design", {"architecture_summary": "구조 설계 완료"}, agent_name="architect")
+    return p
+
+
+@pytest.mark.asyncio
+async def test_discard_running_stage_preserves_completed_agent_outputs(monkeypatch):
+    p = _project_with_design_partially_done()
+    monkeypatch.setattr(main, "projects", {"p1": p})
+
+    result = await main.discard_stage("p1", "design")
+
+    assert result == {"ok": True}
+    assert p.stages["design"].status == StageStatus.PENDING
+    assert p.stages["design"].agents_done == ["architect"]  # 폐기와 달리 안 지워짐
+    assert p.stages["design"].outputs == {"architecture_summary": "구조 설계 완료"}  # 안 비워짐
+    assert p.stages["design"].keep_agents_done is True  # 다음 advance_pipeline이 소비할 힌트
+
+
+@pytest.mark.asyncio
+async def test_cancel_then_reapprove_only_redispatches_incomplete_agent(monkeypatch):
+    """취소 후 재승인(approve_stage → advance_pipeline)했을 때 architect한테는
+    새 태스크가 안 가고 designer한테만 가야 한다."""
+    p = _project_with_design_partially_done()
+    monkeypatch.setattr(main, "projects", {"p1": p})
+    sent = []
+
+    async def _fake_send_task(agent_name, pid, task):
+        sent.append(agent_name)
+
+    monkeypatch.setattr(main.redis, "send_task", _fake_send_task)
+
+    await main.discard_stage("p1", "design")
+    await main.approve_stage("p1", "design")  # 프론트의 "Yes" 버튼과 동일
+
+    assert sent == ["designer"]  # architect는 다시 안 불림
+    assert p.stages["design"].status == StageStatus.RUNNING
+    assert p.stages["design"].agents_done == ["architect"]  # 보존된 채로 유지
+
+
+@pytest.mark.asyncio
+async def test_discard_completed_stage_still_resets_everything_as_before(monkeypatch):
+    """폐기(완료된 스테이지 대상)는 기존 동작 그대로여야 한다 — running 전용
+    보존 로직이 completed 상태에 실수로 새지 않는지 확인."""
+    p = _completed_project()
+    monkeypatch.setattr(main, "projects", {"p1": p})
+
+    await main.discard_stage("p1", "design")
+
+    assert p.stages["design"].status == StageStatus.PENDING
+    assert p.stages["design"].outputs == {}
+    assert p.stages["design"].approved is False
+    assert p.stages["design"].keep_agents_done is False
+
+
 # ── 신규 retry 헬퍼 ──────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

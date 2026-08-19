@@ -261,6 +261,38 @@ def test_mark_running_resets_agents_done_for_a_new_round():
     assert p.stages["design"].status == StageStatus.RUNNING  # architect가 아직 이번 라운드엔 안 끝남
 
 
+def test_mark_running_preserves_agents_done_when_keep_flag_set():
+    """"취소" 시나리오 — design의 architect는 이미 끝났고 designer만 아직 안
+    끝난 채로 취소했을 때, keep_agents_done을 세워두면 재승인해서 다시 도는
+    라운드에서도 architect의 완료 기록이 지워지면 안 된다(지워지면
+    advance_pipeline이 architect한테도 새 태스크를 다시 보내버림 —
+    recoveryfit에서 실제 재현된 문제)."""
+    p = new_pipeline()
+    p.mark_running("design")
+    p.mark_completed("design", {"architecture_summary": "구조"}, agent_name="architect")
+    assert p.stages["design"].agents_done == ["architect"]
+
+    p.stages["design"].keep_agents_done = True
+    p.mark_running("design")  # 취소 후 재승인
+    assert p.stages["design"].agents_done == ["architect"]
+    assert p.stages["design"].outputs == {"architecture_summary": "구조"}  # outputs도 그대로
+
+
+def test_keep_agents_done_flag_is_one_shot():
+    """scenario_scope와 동일한 패턴 — 다음 mark_running 한 번에만 적용되고
+    그 다음부터는 다시 정상적으로(매 라운드) agents_done을 비워야 한다."""
+    p = new_pipeline()
+    p.mark_running("design")
+    p.mark_completed("design", {}, agent_name="architect")
+    p.stages["design"].keep_agents_done = True
+    p.mark_running("design")
+    assert p.stages["design"].keep_agents_done is False
+
+    p.mark_completed("design", {}, agent_name="designer")  # 이번 라운드 마저 완료
+    p.mark_running("design")  # 다음(세 번째) 라운드 — 이번엔 정상적으로 비워져야 함
+    assert p.stages["design"].agents_done == []
+
+
 def test_summary_includes_agents_done_for_persistence():
     p = new_pipeline()
     p.mark_running("design")

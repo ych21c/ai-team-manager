@@ -22,11 +22,17 @@ function canDiscardStage(stageName, status) {
 // 스테이지라 여기서도 제외 — 멈추면 채팅으로 재요청해서 재기획(retry-planning)
 // 경로를 써야 한다.
 //
+// design처럼 에이전트가 여럿(designer+architect)인 스테이지에서 running 중에
+// 취소하면, 서버(_cancel_running_stage)가 이미 완료 보고한 에이전트의 산출물/
+// 완료 기록은 보존하고 재승인 시 아직 안 끝난 에이전트에게만 새 태스크를 보낸다
+// (recoveryfit에서 실제로 architect는 이미 끝났는데 취소하면 처음부터 다시
+// 도는 문제가 있었음 — 지금은 안 그럼).
+//
 // 주의: 취소해도 에이전트 컨테이너 자체를 죽이지는 않는다(CLAUDE.md — running
 // 중 컨테이너 재생성은 진행 중이던 redis 태스크를 xack 전에 유실시킨다). 만약
-// 원래 에이전트가 살아있어서 나중에 완료 이벤트를 보내면, 그 사이 같은 스테이지가
-// 다시 실행돼 있을 경우 stale한 결과로 덮어써질 수 있다 — 그 정도 레이스는 감수하고
-// "죽은 것 같은 작업을 손으로 풀어주는" 용도로만 쓴다.
+// 취소한 그 태스크의 원래 에이전트가 실제로는 살아있어서 나중에 뒤늦게 완료
+// 이벤트를 보내면, 그 사이 재승인해서 다시 돈 결과를 덮어쓸 수 있다 — 그 정도
+// 레이스는 감수하고 "죽은 것 같은 작업을 손으로 풀어주는" 용도로만 쓴다.
 function canCancelStage(stageName, status) {
   return DISCARDABLE_STAGES.has(stageName) && status === "running";
 }

@@ -48,8 +48,17 @@ class Stage:
     # agent_name과 함께 호출될 때만 쓰이고, stage.agents 전원이 여기 모여야
     # 스테이지가 진짜 COMPLETED로 전이한다(먼저 끝난 한 명만으로 착각해 다음
     # 게이트를 열어버리던 문제를 막기 위함). mark_running이 매 라운드 시작 시
-    # 비운다.
+    # 비운다 — 단, keep_agents_done이 True면 비우지 않는다(취소 시 이미 끝낸
+    # 에이전트를 보존하는 용도. 아래 keep_agents_done 참고).
     agents_done: list[str] = field(default_factory=list)
+    # "취소"(실행 중인 스테이지를 되돌림) 전용 1회성 힌트 — design처럼 에이전트가
+    # 여럿(designer+architect)인 스테이지에서 한쪽만 아직 안 끝났는데 취소하면,
+    # 이미 끝낸 쪽까지 통째로 재작업시키던 문제가 있었다(recoveryfit에서 실제
+    # 발생: architect는 이미 끝났는데 취소→재승인하면 architect까지 처음부터 다시
+    # 돎). True면 mark_running이 agents_done을 비우지 않고, advance_pipeline의
+    # 태스크 발송 루프도 이미 agents_done에 있는 에이전트는 건너뛴다. scenario_scope와
+    # 마찬가지로 다음 실행 한 번만 적용되고 advance_pipeline이 바로 False로 되돌린다.
+    keep_agents_done: bool = False
 
 
 PIPELINE_DEFINITION: list[Stage] = [
@@ -101,7 +110,11 @@ class Pipeline:
     def mark_running(self, stage_name: str):
         stage = self.stages[stage_name]
         stage.status = StageStatus.RUNNING
-        stage.agents_done = []  # 새 실행 라운드 — 지난 라운드에 보고한 에이전트 기록 초기화
+        if stage.keep_agents_done:
+            # "취소" 직후 재승인된 라운드 — 이미 끝낸 에이전트 기록을 보존한다.
+            stage.keep_agents_done = False
+        else:
+            stage.agents_done = []  # 새 실행 라운드 — 지난 라운드에 보고한 에이전트 기록 초기화
 
     def mark_completed(self, stage_name: str, outputs: dict = {}, agent_name: str | None = None):
         """스테이지 완료 처리. design처럼 에이전트 2개(designer+architect)가 같은
