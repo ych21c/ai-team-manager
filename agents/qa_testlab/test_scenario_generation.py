@@ -31,6 +31,33 @@ def test_rules_warn_against_pumpandsettle_with_repeating_animation():
     assert "tester.pump(Duration(" in _VERIFY_SCENARIOS_RULES
 
 
+def test_rules_warn_against_single_big_pump_for_async_gated_navigation():
+    # recoveryfit(c052dd6b)에서 실제로 재현된 사고: 스플래시→랜딩 전환이 애니메이션뿐
+    # 아니라 실제 비동기 초기화(Hive/알림 서비스)까지 끝나야 일어나는데, QA가 생성한
+    # 테스트가 `tester.pump(Duration(seconds: 3))`처럼 한 번에 큰 Duration을 pump해서
+    # (프레임/마이크로태스크가 한 번만 진행됨) 3초를 기다려도 여전히 스플래시 화면에
+    # 머물러 있었다 — 앱은 정상인데 테스트가 원천적으로 통과 불가능해서 Implement에
+    # 재작업 요청만 반복 소진했다.
+    assert "pump(Duration(seconds: 3))" in _VERIFY_SCENARIOS_RULES
+    assert "pumpUntilFound" in _VERIFY_SCENARIOS_RULES
+
+
+def test_rules_warn_against_referencing_unimported_screen_classes():
+    # recoveryfit에서 실제 재현: QA가 생성한 테스트가 `find.byType(LandingScreen)`을
+    # 썼는데 그 클래스가 정의된 파일을 import하지 않아서(테스트는 main.dart만 import)
+    # "Undefined name 'LandingScreen'"로 컴파일 자체가 실패했다.
+    assert "find.byType(LandingScreen)" in _VERIFY_SCENARIOS_RULES
+    assert "find.byType(SplashScreen)" in _VERIFY_SCENARIOS_RULES
+
+
+def test_rules_warn_against_joined_text_when_source_splits_lines():
+    # recoveryfit에서 실제 재현: 헤드라인이 소스에서 Text('첫줄')/Text('둘째줄')로 두
+    # 위젯에 나뉘어 있는데, 생성된 테스트는 find.text('첫줄\\n둘째줄')로 합쳐서 찾아서
+    # 항상 findsNothing으로 실패했다.
+    assert "findsNothing" in _VERIFY_SCENARIOS_RULES
+    assert "\\n" in _VERIFY_SCENARIOS_RULES
+
+
 def test_pubspec_package_name_extracted(tmp_path):
     (tmp_path / "pubspec.yaml").write_text(
         "name: counter_app\ndescription: A new Flutter project.\n"
