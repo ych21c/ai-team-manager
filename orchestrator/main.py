@@ -950,8 +950,25 @@ async def _retry_design_with_feedback(pipeline: Pipeline, feedback: str, scenari
         design_stage.outputs = {}
         design_stage.scenario_scope = None
 
+    # implement/qa/autotest는 새 디자인으로 다시 돌아야 하지만, 이전 라운드가
+    # 아직 머지 전(autotest가 COMPLETED까지 못 감)이라면 implement의 branch/
+    # pr_number는 지우지 않고 남겨둔다 — advance_pipeline이 implement를 다시
+    # 돌릴 때 이 branch를 retry_branch로 넘겨서(QA 실패 재시도 경로인
+    # _retry_implement_with_feedback와 동일한 재사용 규칙) 매번 새 브랜치+새
+    # PR을 또 만들지 않고 기존 PR을 이어서 고치게 한다. 예전엔 여기서 무조건
+    # outputs를 비웠어서, "디자인 그대로 재실행"만 해도 PR이 계속 새로 쌓이고
+    # 아무것도 머지되지 않는 문제가 있었다(recoveryfit에서 실제 재현: PR #10
+    # → #12 → #14가 전부 동일 내용인데 하나도 머지 안 됨 — QA 재시도가
+    # "이전 시도(브랜치: 알 수 없음)"라고 보고할 정도로 branch 정보 자체가
+    # 여기서 날아갔었다). 반대로 이전 라운드가 이미 autotest까지 끝나 머지된
+    # 뒤라면 그 브랜치는 이미 죽은(main에 합쳐진) 브랜치이므로 재사용하지 않고
+    # 새로 만든다(안전).
+    prior_round_merged = pipeline.stages["autotest"].status == StageStatus.COMPLETED
+
     for name in ("implement", "qa", "autotest"):
         pipeline.stages[name].status = StageStatus.PENDING
+        if name == "implement" and not prior_round_merged:
+            continue
         pipeline.stages[name].outputs = {}
     pipeline.stages["implement"].approved = False
 
@@ -1280,6 +1297,15 @@ async def advance_pipeline(pipeline: Pipeline):
         # 레포 정보를 context에 포함 → Implement Agent가 활용
         if project_repos.get(pipeline.project_id):
             context["github_repo"] = project_repos[pipeline.project_id]
+
+        # design 재작업 등으로 implement가 "머지 전" 상태에서 다시 도는 경우,
+        # _retry_design_with_feedback가 지우지 않고 남겨둔 branch를 넘겨서 새
+        # PR을 또 만들지 않고 기존 PR을 이어서 고치게 한다 — QA 실패 재시도
+        # 경로(_retry_implement_with_feedback)와 동일한 재사용 규칙.
+        if stage.name == "implement":
+            prior_branch = stage.outputs.get("branch")
+            if prior_branch:
+                context["retry_branch"] = prior_branch
 
         # planning(PM) 재실행 시 이미 만들어둔 Jira 이슈를 보여준다 — 안 보이면 PM이
         # 매 스프린트 같은 요구사항을 다른 문구로 다시 써서, 텍스트 기반 dedup
