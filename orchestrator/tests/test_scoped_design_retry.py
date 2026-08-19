@@ -98,6 +98,52 @@ async def test_scenario_scope_is_a_one_shot_hint_cleared_after_dispatch(monkeypa
     assert p.stages["design"].scenario_scope is None
 
 
+async def test_rerun_stage_endpoint_threads_scenario_key_through(monkeypatch):
+    """실제 사고 경로 재현: 플로우차트 탭 "Run" 버튼(POST .../stage/design/rerun)이
+    scenario_key를 받아 _retry_design_with_feedback으로 그대로 넘기는지 확인한다.
+    예전엔 StageRerun에 scenario_key 필드 자체가 없어서 이 경로로 재실행하면
+    항상 scenario_key=None → 시나리오 전체 재작업이었다(recoveryfit ATM-5~12
+    전체 재생성 사고, 이번엔 채팅 트리아지가 아니라 이 버튼을 통해 재현됨)."""
+    p = _completed_project_with_scenarios("p1", "PRD 원본")
+    main.projects["p1"] = p
+    monkeypatch.setattr(main, "project_jira", {"p1": {"stories": list(_story_titles()), "story_titles": _story_titles()}})
+
+    sent_tasks = []
+
+    async def _fake_send_task(agent_name, pid, task):
+        sent_tasks.append((agent_name, task))
+
+    monkeypatch.setattr(main.redis, "send_task", _fake_send_task)
+
+    await main.rerun_stage("p1", "design", main.StageRerun(feedback="화면 5만 다시", scenario_key="ATM-5"))
+
+    designer_tasks = [t for name, t in sent_tasks if name == "designer"]
+    assert len(designer_tasks) == 1
+    assert designer_tasks[0]["context"]["scenarios"] == [{"key": "ATM-5", "title": "화면 5"}]
+    assert "[디자인 재작업 요청 - ATM-5]" in p.instruction
+
+
+async def test_rerun_stage_endpoint_without_scenario_key_still_works(monkeypatch):
+    """scenario_key를 안 주면(기존 동작) 여전히 전체 재작업으로 폴백해야 한다 —
+    하위 호환 확인."""
+    p = _completed_project_with_scenarios("p1", "PRD 원본")
+    main.projects["p1"] = p
+    monkeypatch.setattr(main, "project_jira", {"p1": {"stories": list(_story_titles()), "story_titles": _story_titles()}})
+
+    sent_tasks = []
+
+    async def _fake_send_task(agent_name, pid, task):
+        sent_tasks.append((agent_name, task))
+
+    monkeypatch.setattr(main.redis, "send_task", _fake_send_task)
+
+    await main.rerun_stage("p1", "design", main.StageRerun(feedback=""))
+
+    designer_tasks = [t for name, t in sent_tasks if name == "designer"]
+    assert len(designer_tasks) == 1
+    assert len(designer_tasks[0]["context"]["scenarios"]) == 8
+
+
 async def test_unknown_scenario_key_falls_back_to_full_retry(monkeypatch):
     p = _completed_project_with_scenarios("p1", "PRD 원본")
     monkeypatch.setattr(main, "project_jira", {"p1": {"stories": list(_story_titles()), "story_titles": _story_titles()}})

@@ -598,13 +598,18 @@ function DecisionBlock({ editTarget, gateTarget, stages, draft, setDraft, editin
   draft: Record<string, string>; setDraft: (fn: (d: Record<string, string>) => Record<string, string>) => void;
   editing: Record<string, boolean>; setEditing: (fn: (d: Record<string, boolean>) => Record<string, boolean>) => void;
   busy: Record<string, boolean>;
-  onRun: (stage: string, feedback: string) => void;
+  onRun: (stage: string, feedback: string, scenarioKey?: string) => void;
   onDiscard: (stage: string) => void;
   onApprove: (stage: string, extraInput?: string) => void;
 }) {
   const [extra, setExtra] = useState("");
+  const [scenarioKey, setScenarioKey] = useState("");
   const isEditing = !!editing[editTarget];
   const editOutputs = stages?.[editTarget]?.outputs;
+  // design/implement는 시나리오(Jira 이슈)별로 화면이 여러 개라 스코프를 안 주면
+  // 프로젝트의 시나리오 전체를 다시 돈다 — recoveryfit에서 화면 1개 재작업 요청이
+  // 시나리오 8개 전체 재생성으로 번진 사고 재발 방지.
+  const scopable = editTarget === "design" || editTarget === "implement";
 
   if (isEditing) {
     return (
@@ -613,10 +618,18 @@ function DecisionBlock({ editTarget, gateTarget, stages, draft, setDraft, editin
         <textarea value={draft[editTarget] ?? ""} onChange={e => setDraft(d => ({ ...d, [editTarget]: e.target.value }))}
           rows={3} placeholder="예: 버튼 색상이 스펙과 달라요"
           style={{ width: "100%", padding: "8px 10px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12.5, fontFamily: "inherit", resize: "vertical", boxSizing: "border-box" }} />
+        {scopable && (
+          <div>
+            <div style={{ fontSize: 11, color: "#888", marginBottom: 4 }}>범위 지정할 Jira 이슈 (선택 — 비우면 전체 시나리오 재작업)</div>
+            <input value={scenarioKey} onChange={e => setScenarioKey(e.target.value)}
+              placeholder="예: ATM-5"
+              style={{ width: "100%", padding: "6px 8px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12.5, boxSizing: "border-box" }} />
+          </div>
+        )}
         <div style={{ display: "flex", gap: 6 }}>
           <button onClick={() => setEditing(v => ({ ...v, [editTarget]: false }))}
             style={{ ...flowBtnStyle, background: "#f5f4f0", color: "#666" }}>취소</button>
-          <button onClick={() => onRun(editTarget, draft[editTarget] ?? "")} disabled={busy[editTarget]}
+          <button onClick={() => onRun(editTarget, draft[editTarget] ?? "", scenarioKey)} disabled={busy[editTarget]}
             style={{ ...flowBtnStyle, background: "#7F77DD", border: "none", color: "#fff", fontWeight: 500 }}>
             {busy[editTarget] ? "실행 중..." : "▶ Run"}
           </button>
@@ -652,9 +665,11 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
   editing: Record<string, boolean>; onStartEdit: (stage: string) => void; onCancelEdit: (stage: string) => void;
   draft: Record<string, string>;
   setDraft: (fn: (d: Record<string, string>) => Record<string, string>) => void;
-  busy: Record<string, boolean>; onRun: (stage: string, feedback: string) => void;
+  busy: Record<string, boolean>; onRun: (stage: string, feedback: string, scenarioKey?: string) => void;
   onDiscard: (stage: string) => void;
 }) {
+  const [scenarioKey, setScenarioKey] = useState("");
+  const scopable = name === "design" || name === "implement";
   const meta = STAGE_META[name];
   const agentMeta = AGENT_META[meta.agents[0]] ?? { label: meta.label, color: "#666", bg: "#f0f0f0" };
   const status = (stageInfo?.status ?? "pending") as AgentStatus;
@@ -788,10 +803,15 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 <textarea value={draft[name] ?? ""} onChange={e => setDraft(d => ({ ...d, [name]: e.target.value }))}
                   rows={2} placeholder="재작업 요청 내용 (비워두면 같은 입력으로 재실행)" style={{ width: "100%", padding: "6px 8px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12, fontFamily: "inherit", boxSizing: "border-box" }} />
+                {scopable && (
+                  <input value={scenarioKey} onChange={e => setScenarioKey(e.target.value)}
+                    placeholder="범위 지정할 Jira 이슈 (선택 — 예: ATM-5, 비우면 전체 시나리오 재작업)"
+                    style={{ width: "100%", padding: "6px 8px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12, boxSizing: "border-box" }} />
+                )}
                 <div style={{ display: "flex", gap: 6 }}>
                   <button onClick={() => onCancelEdit(name)}
                     style={{ ...flowBtnStyle, background: "#f5f4f0", color: "#666" }}>취소</button>
-                  <button onClick={() => onRun(name, draft[name] ?? "")} disabled={busy[name]}
+                  <button onClick={() => onRun(name, draft[name] ?? "", scenarioKey)} disabled={busy[name]}
                     style={{ ...flowBtnStyle, background: "#7F77DD", border: "none", color: "#fff" }}>
                     {busy[name] ? "실행 중..." : "▶ Run"}
                   </button>
@@ -856,8 +876,8 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
     }
   };
 
-  const runStage = (stage: string, feedback: string) => withBusy(stage, async () => {
-    await post(`/projects/${projectId}/stage/${stage}/rerun`, { feedback });
+  const runStage = (stage: string, feedback: string, scenarioKey?: string) => withBusy(stage, async () => {
+    await post(`/projects/${projectId}/stage/${stage}/rerun`, { feedback, scenario_key: scenarioKey?.trim() || null });
     setEditing(v => ({ ...v, [stage]: false }));
   });
   const discardStage = (stage: string) => withBusy(stage, () => post(`/projects/${projectId}/stage/${stage}/discard`));

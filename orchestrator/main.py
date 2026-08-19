@@ -1894,6 +1894,13 @@ async def retry_implement(project_id: str, body: RetryFeedback):
 
 class StageRerun(BaseModel):
     feedback: str = ""
+    # 지정하면 이 Jira 이슈 키(예: "ATM-5") 하나만 재작업 — 없으면(None) 스테이지
+    # 전체(모든 시나리오)를 다시 돈다. recoveryfit에서 실제 재현: 플로우차트 탭
+    # "Run"으로 화면 1개짜리 재작업을 돌렸는데 이 필드가 아예 없어서 매번
+    # scenario_key=None으로 넘어가 시나리오 8개가 전부 재생성됐다 — retry-design/
+    # retry-implement 엔드포인트는 이미 scenario_key를 받는데 이 엔드포인트만
+    # 빠져 있었다.
+    scenario_key: str | None = None
 
 _RERUN_NO_CHANGE_TEXT = "(변경 없음 — 같은 내용으로 재실행)"
 
@@ -1911,9 +1918,9 @@ async def rerun_stage(project_id: str, stage_name: str, body: StageRerun):
     if stage_name == "planning":
         await _retry_planning_with_feedback(p, feedback, full_rewrite=False)
     elif stage_name == "design":
-        await _retry_design_with_feedback(p, feedback)
+        await _retry_design_with_feedback(p, feedback, body.scenario_key)
     elif stage_name == "implement":
-        await _retry_implement_with_feedback(p, feedback)
+        await _retry_implement_with_feedback(p, feedback, body.scenario_key)
     elif stage_name == "qa":
         await _retry_qa_with_feedback(p, body.feedback.strip())
     elif stage_name == "autotest":
