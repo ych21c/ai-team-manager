@@ -83,6 +83,13 @@ project_deploy_status: dict[str, dict] = {}
 # host.docker.internal은 Docker Desktop for Mac이 기본 제공하는 호스트 DNS.
 DEPLOY_RUNNER_URL = os.getenv("DEPLOY_RUNNER_URL", "http://host.docker.internal:8765")
 qa_retry_counts: dict[str, int] = {}   # project_id → QA/AutoTest가 Implement에 재작업 요청한 횟수 (합산)
+# _save_project/_load_all_projects가 이 값도 STATE_DIR에 함께 영속화한다 — 예전엔
+# 메모리에만 있어서 orchestrator/main.py를 바인드 마운트로 라이브 편집할 때마다
+# (예: self-improve 프로젝트가 자기 자신의 소스를 고치는 동안) uvicorn --reload가
+# 프로세스를 재시작해서 이 카운터가 조용히 0으로 리셋됐다. 그러면 recoveryfit
+# 프로젝트가 같은 지점(스플래시→랜딩 전환 시나리오)에서 몇 시간째 반복 실패해도
+# "1/3"만 계속 찍히고 MAX_QA_RETRIES에 절대 도달하지 못해 자동 정지 가드가
+# 사실상 무력화됐다(실제로 재현 — 사람이 수동으로 취소할 때까지 안 멈췄음).
 MAX_QA_RETRIES = 3   # 이 횟수를 넘으면 재시도 없이 실패 처리하고 파이프라인을 멈춤 (무한루프 방지)
 chat_triage_in_flight: dict[str, float] = {}   # project_id → PM triage 태스크를 보낸 시각
 CHAT_TRIAGE_TIMEOUT_SEC = 120   # 이 시간이 지나면 stale로 보고 새 triage를 다시 보낸다 (에이전트 크래시 등으로 stage_completed가 영영 안 올 경우 대비)
@@ -180,6 +187,7 @@ def _save_project(pid: str):
         **_make_project_info(pid),  # instruction도 이제 여기 포함됨
         "jira": project_jira.get(pid, {}),
         "doc":  project_docs.get(pid, {}),
+        "qa_retry_count": qa_retry_counts.get(pid, 0),
         # _make_project_info()의 "token_totals"는 API/WS용 파생 뷰({lifetime, by_sprint})라
         # 그대로 저장하면 재시작 후 _load_all_projects가 그걸 원본으로 착각해
         # 이중 파생/오염된다 — 여기서 내부 저장 모양({by_sprint, pre_migration})으로 덮어쓴다.
@@ -233,6 +241,8 @@ def _load_all_projects():
             project_docs[pid] = data["doc"]
         if data.get("token_totals"):
             project_token_totals[pid] = _migrate_token_totals(data["token_totals"])
+        if data.get("qa_retry_count"):
+            qa_retry_counts[pid] = data["qa_retry_count"]
         if data.get("deploy_config"):
             project_deploy_config[pid] = data["deploy_config"]
         if data.get("deploy_status"):
