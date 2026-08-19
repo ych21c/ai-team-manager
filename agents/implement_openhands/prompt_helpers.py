@@ -20,3 +20,11 @@ def mockup_guidance(scenario_keys: list[str] | None) -> str:
             f"다른 화면/기능은 이미 반영돼 있으니 절대 건드리지 마세요."
         )
     return "파일마다 다른 화면이니 전부 확인하고, 목업과 실제 앱 화면이 다르면 안 됩니다."
+
+
+NO_EMULATOR_GUIDANCE = (
+    "integration_test/의 시나리오 테스트를 실제로 실행해보지 마세요 — 이 컨테이너는 "
+    "Linux 전용이라 Android/iOS 에뮬레이터가 없어서 `flutter emulators`/`adb devices`로 "
+    "찾아봐도 항상 실패하고, 그 삽질에 토큰만 낭비됩니다. 실제 실행/검증은 QA 담당이니 "
+    "여러분은 코드만 고치고 `flutter analyze`/`flutter build apk --debug`로만 확인하세요."
+)

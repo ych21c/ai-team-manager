@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from prompt_helpers import mockup_guidance
+from prompt_helpers import mockup_guidance, NO_EMULATOR_GUIDANCE
 
 
 def test_no_scenario_key_asks_to_check_every_screen():
@@ -36,3 +36,13 @@ def test_multiple_scenario_keys_narrows_to_those_screens_only():
     assert "design/applied/ATM-10.html" in guidance
     assert "다른 화면" in guidance and "건드리지 마세요" in guidance
     assert "전부 확인" not in guidance
+
+
+def test_no_emulator_guidance_tells_implement_not_to_run_tests_itself():
+    # c052dd6b(recoveryfit) 프로젝트에서 실제로 재현됨: 이 문구가 없으면
+    # OpenHands가 QA의 integration_test 시나리오를 스스로 검증하겠다고
+    # `flutter emulators`/`adb devices`로 에뮬레이터를 찾다가(Linux 컨테이너라
+    # 항상 실패) 입력 토큰 1.3M+를 낭비하고 포기했다.
+    assert "flutter emulators" in NO_EMULATOR_GUIDANCE
+    assert "adb devices" in NO_EMULATOR_GUIDANCE
+    assert "QA" in NO_EMULATOR_GUIDANCE

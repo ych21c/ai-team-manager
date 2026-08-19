@@ -30,7 +30,7 @@ from openhands.tools.terminal import TerminalTool
 
 from build_apk import build_and_handoff_apk, _extract_issue_lines, _has_analyze_errors
 from git_workspace import run, ensure_git_workspace
-from prompt_helpers import mockup_guidance
+from prompt_helpers import mockup_guidance, NO_EMULATOR_GUIDANCE
 
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
 AGENT_NAME   = "implement"
@@ -191,6 +191,7 @@ def run_openhands_task(workspace: str, instruction: str, project_id: str, is_ret
             f"미묘하게 안 맞아 빌드가 반복 실패하는 원인이 됩니다). "
             f"작업을 마치기 전에 `flutter analyze`와 `flutter build apk --debug`를 직접 실행해서 "
             f"실제로 빌드되는 것까지 확인하고, 실패하면 그 자리에서 고치세요. "
+            f"{NO_EMULATOR_GUIDANCE} "
             f"작업을 완료했으면 변경사항을 정리하고 멈추세요. "
             f"git commit/push는 직접 하지 마세요 (다른 프로세스가 처리합니다)."
         )
