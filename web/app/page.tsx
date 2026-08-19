@@ -1101,7 +1101,13 @@ function DeployPanel({ projectId, config, status, releaseCompleted }: {
                 </>
               ) : (
                 <>
-                  <div style={{ flex: 1, color: value ? "#333" : "#bbb" }}>{value || "미설정"}</div>
+                  {/* host_workspace_path 같은 긴 절대 경로는 공백이 없어 flex:1
+                      자식의 기본 min-width:auto 때문에 줄어들지 못하고 페이지
+                      전체를 옆으로 밀어 좌우 스크롤을 만든다 — minWidth:0으로
+                      줄어들 수 있게 하고, 넘치는 부분은 이 박스 안에서만
+                      가로 스크롤되게 가둔다(예전처럼 화면 안에서 잘려 보이되,
+                      필요하면 이 박스만 스크롤해서 끝까지 볼 수 있게). */}
+                  <div style={{ flex: 1, minWidth: 0, overflowX: "auto", whiteSpace: "nowrap", color: value ? "#333" : "#bbb" }}>{value || "미설정"}</div>
                   <button onClick={() => startEdit(key, value)} title="수정" style={{ fontSize: 11, padding: "2px 6px", borderRadius: 5, border: "0.5px solid #e5e5e5", background: "#f7f7f5", color: "#888", cursor: "pointer" }}>✎</button>
                 </>
               )}
