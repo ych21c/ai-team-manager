@@ -8,6 +8,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -sSL https://sdk.cloud.google.com | bash -s -- --disable-prompts --install-dir=/opt \
     && rm -rf /var/lib/apt/lists/*
 
+# QA가 검증용으로 생성하는 시나리오 테스트는 integration_test 패키지 기반이라(실제
+# 기기/Firebase Test Lab에서도 그대로 돌리기 위해 — verify_scenarios의 프롬프트
+# 참고) `flutter test`가 로컬에서 이를 실행하려면 flutter-tester가 아니라 Linux
+# 데스크톱 타깃으로 실제 빌드해야 한다. 이 패키지들이 없으면 매 라운드
+# "CMake is required for Linux development."로 즉시 실패해서, 실제 앱 코드는
+# 한 번도 검증되지 못한 채 QA/재작업 예산만 반복 소진되는 사고가 있었다
+# (recoveryfit에서 실제 재현: 하루 종일 모든 QA 라운드가 이 에러 하나로 실패).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake ninja-build clang lld llvm pkg-config libgtk-3-dev liblzma-dev xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
 # 이 이미지는 arm64(Apple Silicon) 네이티브인데 Android SDK의 aapt2는 x86_64
 # 바이너리라, Rosetta가 번역을 시도해도 이미지 안에 x86_64용 동적 링커/런타임
 # 라이브러리가 아예 없어 "failed to open elf at /lib64/ld-linux-x86-64.so.2"로

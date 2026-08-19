@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run import (
     _pubspec_package_name, _DART_CODE_BLOCK_RE, _TESTWIDGETS_TITLE_RE,
     _filter_screenshot_paths, _extract_json_object, _finalize_qa_outputs,
-    _resolve_target_branch, _extract_scenario_test_code,
+    _resolve_target_branch, _extract_scenario_test_code, _scenario_test_cmd,
     _list_source_files, SOURCE_TOTAL_EXCERPT_LIMIT, determine_build_command,
     _VERIFY_SCENARIOS_RULES,
 )
@@ -321,3 +321,14 @@ def test_qa_flavor_convention_still_used_when_both_present(tmp_path):
     cmd, reason = determine_build_command(str(tmp_path))
     assert reason is None
     assert cmd == ["flutter", "build", "apk", "--flavor", "qa", "--debug", "-t", "lib/main_test.dart"]
+
+
+def test_scenario_test_cmd_wraps_flutter_test_in_xvfb():
+    # integration_test 기반 시나리오 테스트는 flutter-tester가 아니라 실제 Linux
+    # 데스크톱 앱(GTK 창)으로 빌드돼서, 디스플레이 없는 컨테이너에서 xvfb 없이
+    # 돌리면 빌드는 성공해놓고 실행만 "Error waiting for a debug connection"으로
+    # 항상 실패했다(recoveryfit에서 실제 재현 — 하루 종일 모든 QA 라운드가 이걸로
+    # 실패). xvfb-run으로 감싸야 실제로 끝까지 실행된다.
+    assert _scenario_test_cmd("integration_test/scenario_test.dart") == [
+        "xvfb-run", "-a", "flutter", "test", "integration_test/scenario_test.dart",
+    ]
