@@ -94,8 +94,8 @@ async def test_target_existing_key_is_passed_through_as_scenario_key(monkeypatch
 
     calls = []
 
-    async def _fake_retry_design(pipeline, feedback, scenario_key=None):
-        calls.append(scenario_key)
+    async def _fake_retry_design(pipeline, feedback, scenario_keys=None):
+        calls.append(scenario_keys)
 
     monkeypatch.setattr(main, "_retry_design_with_feedback", _fake_retry_design)
 
@@ -104,7 +104,7 @@ async def test_target_existing_key_is_passed_through_as_scenario_key(monkeypatch
         "feedback": "로고가 이상함", "reply": "ATM-5만 다시 만들게요",
     })
 
-    assert calls == ["ATM-5"]
+    assert calls == [["ATM-5"]]
 
 
 async def test_target_new_creates_jira_story_then_scopes_to_it(monkeypatch):
@@ -122,8 +122,8 @@ async def test_target_new_creates_jira_story_then_scopes_to_it(monkeypatch):
 
     calls = []
 
-    async def _fake_retry_design(pipeline, feedback, scenario_key=None):
-        calls.append(scenario_key)
+    async def _fake_retry_design(pipeline, feedback, scenario_keys=None):
+        calls.append(scenario_keys)
 
     monkeypatch.setattr(main, "_retry_design_with_feedback", _fake_retry_design)
 
@@ -138,7 +138,7 @@ async def test_target_new_creates_jira_story_then_scopes_to_it(monkeypatch):
     assert jira["story_titles"]["ATM-9"] == "다크모드 지원"
     assert jira["epic"] == "ATM-1"
     # 새로 만든 키로 스코프가 좁혀졌는지
-    assert calls == ["ATM-9"]
+    assert calls == [["ATM-9"]]
 
 
 async def test_target_unknown_key_falls_back_to_unscoped(monkeypatch):
@@ -149,8 +149,8 @@ async def test_target_unknown_key_falls_back_to_unscoped(monkeypatch):
 
     calls = []
 
-    async def _fake_retry_implement(pipeline, feedback, scenario_key=None):
-        calls.append(scenario_key)
+    async def _fake_retry_implement(pipeline, feedback, scenario_keys=None):
+        calls.append(scenario_keys)
 
     monkeypatch.setattr(main, "_retry_implement_with_feedback", _fake_retry_implement)
 
@@ -168,8 +168,8 @@ async def test_no_target_falls_back_to_unscoped(monkeypatch):
 
     calls = []
 
-    async def _fake_retry_design(pipeline, feedback, scenario_key=None):
-        calls.append(scenario_key)
+    async def _fake_retry_design(pipeline, feedback, scenario_keys=None):
+        calls.append(scenario_keys)
 
     monkeypatch.setattr(main, "_retry_design_with_feedback", _fake_retry_design)
 

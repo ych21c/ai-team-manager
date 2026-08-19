@@ -147,7 +147,7 @@ def ensure_ci_workflow(workspace: str) -> bool:
     return True
 
 
-def run_openhands_task(workspace: str, instruction: str, project_id: str, is_retry: bool, scenario_key: str | None = None) -> tuple[int, dict, str]:
+def run_openhands_task(workspace: str, instruction: str, project_id: str, is_retry: bool, scenario_keys: list[str] | None = None) -> tuple[int, dict, str]:
     """OpenHands Conversation을 (동기적으로) 실행. 블로킹 호출이므로 to_thread로 감싸서 호출한다.
     반환값의 두 번째 원소는 이번 실행의 토큰/비용(OpenHands SDK의 llm.metrics가 이미 누적
     집계 — 플로우차트 탭 게이트에 표시하기 위함). 세 번째 원소는 MAX_SELF_FIX_ROUNDS를
@@ -184,7 +184,7 @@ def run_openhands_task(workspace: str, instruction: str, project_id: str, is_ret
             f"모듈 구조/데이터 모델)가 있으면 먼저 읽어보세요 — 특히 architect_output.md의 "
             f"module_structure는 architect가 정한 폴더/파일 구조와 책임 분담이니 임의로 다른 "
             f"구조로 만들지 말고 그대로 따르세요. design/applied/*.html이 있으면 그 레이아웃/ "
-            f"색상/버튼 배치를 최대한 그대로 Flutter 위젯으로 재현하세요 — {mockup_guidance(scenario_key)} "
+            f"색상/버튼 배치를 최대한 그대로 Flutter 위젯으로 재현하세요 — {mockup_guidance(scenario_keys)} "
             f"이 컨테이너엔 Flutter/Android SDK가 설치돼 있습니다. Flutter 프로젝트가 아직 없으면 "
             f"android/ 밑 Gradle 파일들을 직접 타이핑하지 말고 반드시 `flutter create .`로 "
             f"골격을 생성한 뒤 그 위에 코드를 작성하세요 (손으로 만든 Gradle 설정은 버전이 "
@@ -236,7 +236,7 @@ async def process_task(r: aioredis.Redis, task: dict):
     github_repo  = task.get("github_repo", "")
     context      = task.get("context", {})
     retry_branch = context.get("retry_branch")
-    scenario_key = context.get("scenario_key")
+    scenario_keys = context.get("scenario_keys")
     workspace    = f"/workspace/{project_id}"
 
     await emit(r, {
@@ -289,7 +289,7 @@ async def process_task(r: aioredis.Redis, task: dict):
                     "content": f"🤖 OpenHands 실행 중... (브랜치: {branch})"})
 
     try:
-        event_count, token_usage, unresolved = await asyncio.to_thread(run_openhands_task, workspace, instruction, project_id, bool(retry_branch), scenario_key)
+        event_count, token_usage, unresolved = await asyncio.to_thread(run_openhands_task, workspace, instruction, project_id, bool(retry_branch), scenario_keys)
         await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
                         "content": f"✅ OpenHands 작업 완료 ({event_count}개 이벤트)"})
     except Exception as e:
@@ -350,7 +350,7 @@ async def process_task(r: aioredis.Redis, task: dict):
         await emit(r, {"type": "stage_completed", "project_id": project_id, "agent": AGENT_NAME,
                         "stage": stage, "outputs": {"agent": AGENT_NAME, "summary": "PR 생성 실패",
                                                      "branch": branch, "head_sha": head_sha,
-                                                     "build_ok": build_ok, "scenario_key": scenario_key,
+                                                     "build_ok": build_ok, "scenario_keys": scenario_keys,
                                                      **token_usage}})
         return
 
@@ -367,9 +367,9 @@ async def process_task(r: aioredis.Redis, task: dict):
             "head_sha": head_sha,
             "build_ok": build_ok,
             # 오케스트레이터(main.py)가 이 PR 링크 코멘트를 어느 Jira 이슈에 달지
-            # 결정할 때 필요 — 범위가 특정 시나리오로 좁혀진 재작업(scenario_key
-            # 있음)이면 그 이슈 하나에만, 아니면(None) 전체 스토리에 단다.
-            "scenario_key": scenario_key,
+            # 결정할 때 필요 — 범위가 특정 시나리오(들)로 좁혀진 재작업
+            # (scenario_keys 있음)이면 그 이슈들에만, 아니면(None) 전체 스토리에 단다.
+            "scenario_keys": scenario_keys,
             **token_usage,
         },
     })

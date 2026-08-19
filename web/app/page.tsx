@@ -23,7 +23,8 @@ interface Message {
   id: string; from: string; content: string; ts: number; video?: string;
 }
 interface JiraInfo {
-  epic?: string; stories?: string[]; confluence_url?: string; jira_url?: string;
+  epic?: string; stories?: string[]; story_titles?: Record<string, string>;
+  confluence_url?: string; jira_url?: string;
 }
 interface StageTokenTotal { input_tokens: number; output_tokens: number; cost_usd: number; }
 interface TokenTotals {
@@ -593,18 +594,66 @@ const flowBtnStyle: CSSProperties = {
   padding: "6px 12px", fontSize: 12, borderRadius: 6, cursor: "pointer", border: "0.5px solid #e5e5e5",
 };
 
-function DecisionBlock({ editTarget, gateTarget, stages, draft, setDraft, editing, setEditing, busy, onRun, onDiscard, onApprove }: {
+// design/implement는 시나리오(Jira 이슈)별로 화면이 여러 개라 스코프를 안 주면
+// 프로젝트의 시나리오 전체를 다시 돈다 — recoveryfit에서 화면 1개 재작업 요청이
+// 시나리오 8개 전체 재생성으로 번진 사고 재발 방지용 체크박스 목록. 기본은
+// "전체 선택"(=오늘까지의 기본 동작과 동일)이고, 사용자가 체크를 해제해서
+// 범위를 좁힌다 — 처음부터 빈 목록으로 시작하면 매번 일일이 골라야 해서
+// "영향받는 이슈는 기본으로 선택돼 있어야" 한다는 요구에 어긋난다.
+function ScenarioScopePicker({ jira, selected, onChange }: {
+  jira?: JiraInfo; selected: string[]; onChange: (keys: string[]) => void;
+}) {
+  const stories = jira?.stories ?? [];
+  const touchedRef = useRef(false);
+  useEffect(() => {
+    if (!touchedRef.current && stories.length > 0 && selected.length === 0) onChange(stories);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stories.length]);
+
+  if (stories.length === 0) return null;
+
+  const toggle = (key: string) => {
+    touchedRef.current = true;
+    onChange(selected.includes(key) ? selected.filter(k => k !== key) : [...selected, key]);
+  };
+
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: "#888", marginBottom: 4 }}>범위 지정 (기본 전체 선택 — 체크 해제해서 좁히세요)</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 3, maxHeight: 140, overflowY: "auto", border: "0.5px solid #e5e5e5", borderRadius: 6, padding: "6px 8px" }}>
+        {stories.map(key => (
+          <label key={key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+            <input type="checkbox" checked={selected.includes(key)} onChange={() => toggle(key)} />
+            <span style={{ fontFamily: "monospace", color: "#666" }}>{key}</span>
+            <span style={{ color: "#999" }}>{jira?.story_titles?.[key] ?? ""}</span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// 체크박스 전부 선택(=오늘까지의 기본 "전체 재작업")이거나 하나도 선택 안 했으면
+// 스코프 없음(undefined)으로 보내고, 일부만 선택했을 때만 실제로 좁힌다.
+function resolveScenarioKeys(selected: string[], totalCount: number): string[] | undefined {
+  return selected.length > 0 && selected.length < totalCount ? selected : undefined;
+}
+
+function DecisionBlock({ editTarget, gateTarget, stages, jira, draft, setDraft, editing, setEditing, busy, onRun, onDiscard, onApprove }: {
   editTarget: StageName; gateTarget: StageName; stages: Record<string, StageInfo> | undefined;
+  jira?: JiraInfo;
   draft: Record<string, string>; setDraft: (fn: (d: Record<string, string>) => Record<string, string>) => void;
   editing: Record<string, boolean>; setEditing: (fn: (d: Record<string, boolean>) => Record<string, boolean>) => void;
   busy: Record<string, boolean>;
-  onRun: (stage: string, feedback: string) => void;
+  onRun: (stage: string, feedback: string, scenarioKeys?: string[]) => void;
   onDiscard: (stage: string) => void;
   onApprove: (stage: string, extraInput?: string) => void;
 }) {
   const [extra, setExtra] = useState("");
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const isEditing = !!editing[editTarget];
   const editOutputs = stages?.[editTarget]?.outputs;
+  const scopable = editTarget === "design" || editTarget === "implement";
 
   if (isEditing) {
     return (
@@ -613,10 +662,11 @@ function DecisionBlock({ editTarget, gateTarget, stages, draft, setDraft, editin
         <textarea value={draft[editTarget] ?? ""} onChange={e => setDraft(d => ({ ...d, [editTarget]: e.target.value }))}
           rows={3} placeholder="예: 버튼 색상이 스펙과 달라요"
           style={{ width: "100%", padding: "8px 10px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12.5, fontFamily: "inherit", resize: "vertical", boxSizing: "border-box" }} />
+        {scopable && <ScenarioScopePicker jira={jira} selected={selectedKeys} onChange={setSelectedKeys} />}
         <div style={{ display: "flex", gap: 6 }}>
           <button onClick={() => setEditing(v => ({ ...v, [editTarget]: false }))}
             style={{ ...flowBtnStyle, background: "#f5f4f0", color: "#666" }}>취소</button>
-          <button onClick={() => onRun(editTarget, draft[editTarget] ?? "")} disabled={busy[editTarget]}
+          <button onClick={() => onRun(editTarget, draft[editTarget] ?? "", resolveScenarioKeys(selectedKeys, jira?.stories?.length ?? 0))} disabled={busy[editTarget]}
             style={{ ...flowBtnStyle, background: "#7F77DD", border: "none", color: "#fff", fontWeight: 500 }}>
             {busy[editTarget] ? "실행 중..." : "▶ Run"}
           </button>
@@ -645,16 +695,18 @@ function DecisionBlock({ editTarget, gateTarget, stages, draft, setDraft, editin
   );
 }
 
-function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpand, onOpenDesign,
+function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpand, onOpenDesign, jira,
                     editing, onStartEdit, onCancelEdit, draft, setDraft, busy, onRun, onDiscard }: {
   name: StageName; stageInfo?: StageInfo; projectId: string; isActive: boolean;
-  expanded: boolean; onToggleExpand: () => void; onOpenDesign: () => void;
+  expanded: boolean; onToggleExpand: () => void; onOpenDesign: () => void; jira?: JiraInfo;
   editing: Record<string, boolean>; onStartEdit: (stage: string) => void; onCancelEdit: (stage: string) => void;
   draft: Record<string, string>;
   setDraft: (fn: (d: Record<string, string>) => Record<string, string>) => void;
-  busy: Record<string, boolean>; onRun: (stage: string, feedback: string) => void;
+  busy: Record<string, boolean>; onRun: (stage: string, feedback: string, scenarioKeys?: string[]) => void;
   onDiscard: (stage: string) => void;
 }) {
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
+  const scopable = name === "design" || name === "implement";
   const meta = STAGE_META[name];
   const agentMeta = AGENT_META[meta.agents[0]] ?? { label: meta.label, color: "#666", bg: "#f0f0f0" };
   const status = (stageInfo?.status ?? "pending") as AgentStatus;
@@ -788,10 +840,11 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 <textarea value={draft[name] ?? ""} onChange={e => setDraft(d => ({ ...d, [name]: e.target.value }))}
                   rows={2} placeholder="재작업 요청 내용 (비워두면 같은 입력으로 재실행)" style={{ width: "100%", padding: "6px 8px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12, fontFamily: "inherit", boxSizing: "border-box" }} />
+                {scopable && <ScenarioScopePicker jira={jira} selected={selectedKeys} onChange={setSelectedKeys} />}
                 <div style={{ display: "flex", gap: 6 }}>
                   <button onClick={() => onCancelEdit(name)}
                     style={{ ...flowBtnStyle, background: "#f5f4f0", color: "#666" }}>취소</button>
-                  <button onClick={() => onRun(name, draft[name] ?? "")} disabled={busy[name]}
+                  <button onClick={() => onRun(name, draft[name] ?? "", resolveScenarioKeys(selectedKeys, jira?.stories?.length ?? 0))} disabled={busy[name]}
                     style={{ ...flowBtnStyle, background: "#7F77DD", border: "none", color: "#fff" }}>
                     {busy[name] ? "실행 중..." : "▶ Run"}
                   </button>
@@ -856,8 +909,8 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
     }
   };
 
-  const runStage = (stage: string, feedback: string) => withBusy(stage, async () => {
-    await post(`/projects/${projectId}/stage/${stage}/rerun`, { feedback });
+  const runStage = (stage: string, feedback: string, scenarioKeys?: string[]) => withBusy(stage, async () => {
+    await post(`/projects/${projectId}/stage/${stage}/rerun`, { feedback, scenario_keys: scenarioKeys?.length ? scenarioKeys : null });
     setEditing(v => ({ ...v, [stage]: false }));
   });
   const discardStage = (stage: string) => withBusy(stage, () => post(`/projects/${projectId}/stage/${stage}/discard`));
@@ -917,7 +970,7 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
               name={name} stageInfo={stages?.[name]} projectId={projectId}
               isActive={name === activeGate || (nextGated && next === activeGate)}
               expanded={isExpanded(name)} onToggleExpand={() => setExpanded(v => ({ ...v, [name]: !isExpanded(name) }))}
-              onOpenDesign={onOpenDesign}
+              onOpenDesign={onOpenDesign} jira={project?.jira}
               editing={editing} onStartEdit={n => setEditing(v => ({ ...v, [n]: true }))}
               onCancelEdit={n => setEditing(v => ({ ...v, [n]: false }))}
               draft={draft} setDraft={setDraft} busy={busy}
@@ -926,7 +979,7 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
             {next && (
               showGate ? (
                 <DecisionBlock
-                  editTarget={name} gateTarget={next} stages={stages}
+                  editTarget={name} gateTarget={next} stages={stages} jira={project?.jira}
                   draft={draft} setDraft={setDraft} editing={editing} setEditing={setEditing} busy={busy}
                   onRun={runStage} onDiscard={discardStage} onApprove={approveStage}
                 />
@@ -1048,7 +1101,13 @@ function DeployPanel({ projectId, config, status, releaseCompleted }: {
                 </>
               ) : (
                 <>
-                  <div style={{ flex: 1, color: value ? "#333" : "#bbb" }}>{value || "미설정"}</div>
+                  {/* host_workspace_path 같은 긴 절대 경로는 공백이 없어 flex:1
+                      자식의 기본 min-width:auto 때문에 줄어들지 못하고 페이지
+                      전체를 옆으로 밀어 좌우 스크롤을 만든다 — minWidth:0으로
+                      줄어들 수 있게 하고, 넘치는 부분은 이 박스 안에서만
+                      가로 스크롤되게 가둔다(예전처럼 화면 안에서 잘려 보이되,
+                      필요하면 이 박스만 스크롤해서 끝까지 볼 수 있게). */}
+                  <div style={{ flex: 1, minWidth: 0, overflowX: "auto", whiteSpace: "nowrap", color: value ? "#333" : "#bbb" }}>{value || "미설정"}</div>
                   <button onClick={() => startEdit(key, value)} title="수정" style={{ fontSize: 11, padding: "2px 6px", borderRadius: 5, border: "0.5px solid #e5e5e5", background: "#f7f7f5", color: "#888", cursor: "pointer" }}>✎</button>
                 </>
               )}

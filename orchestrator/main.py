@@ -468,7 +468,7 @@ async def handle_agent_event(event: dict):
             # (또는 이미 끝난) 첫 번째 이슈에 계속 쌓이는 문제가 있었다. 범위 제한이
             # 없는 전체 작업(초기 구현 등)은 그 PR이 모든 스토리에 다 영향을 주므로
             # 스토리 전체에 단다.
-            target_stories = _implement_jira_comment_targets(outputs.get("scenario_key"), stories)
+            target_stories = _implement_jira_comment_targets(outputs.get("scenario_keys"), stories)
             comment = f"🤖 구현 완료 — PR: {pr_url}" if pr_url else f"⚠️ 구현 단계 완료했지만 PR 생성 실패: {outputs.get('summary', '')}"
             for story in target_stories:
                 target = _stage_issue_target(project_id, story, "implement")
@@ -892,7 +892,7 @@ async def _handle_chat_triage_result(pipeline: Pipeline, project_id: str, output
             "content": f"🔁 PM 판단: 디자인 재작업이 필요합니다{scope_note} — designer/architect부터 다시 시작합니다.\n{feedback}",
         })
         await _add_history(project_id, f"🔁 채팅 요청 → 디자인 재작업{scope_note_plain}: {feedback}")
-        await _retry_design_with_feedback(pipeline, feedback, scenario_key)
+        await _retry_design_with_feedback(pipeline, feedback, [scenario_key] if scenario_key else None)
     elif scope == "implement" and feedback:
         scope_note = f" ({_story_link(project_id, scenario_key, 'impl')}만)" if scenario_key else ""
         scope_note_plain = f" ({_story_plain(project_id, scenario_key, 'impl')}만)" if scenario_key else ""
@@ -901,7 +901,7 @@ async def _handle_chat_triage_result(pipeline: Pipeline, project_id: str, output
             "content": f"🔁 PM 판단: 구현 수정이 필요합니다{scope_note} — Implement에 재작업을 요청합니다.\n{feedback}",
         })
         await _add_history(project_id, f"🔁 채팅 요청 → 구현 재작업{scope_note_plain}: {feedback}")
-        await _retry_implement_with_feedback(pipeline, feedback, scenario_key)
+        await _retry_implement_with_feedback(pipeline, feedback, [scenario_key] if scenario_key else None)
     else:
         await broadcast({
             "type": "agent_message", "project_id": project_id, "agent": "system",
@@ -909,7 +909,7 @@ async def _handle_chat_triage_result(pipeline: Pipeline, project_id: str, output
         })
 
 
-async def _retry_design_with_feedback(pipeline: Pipeline, feedback: str, scenario_key: str | None = None):
+async def _retry_design_with_feedback(pipeline: Pipeline, feedback: str, scenario_keys: list[str] | None = None):
     """디자인 목업이 마음에 안 들거나 화면을 더 추가하고 싶을 때,
     사람이 피드백과 함께 디자인부터 다시 돌리는 수동 개입용 엔드포인트.
     design뿐 아니라 그 위에서 이미 진행된 implement/qa/autotest도 새 디자인을
@@ -918,12 +918,14 @@ async def _retry_design_with_feedback(pipeline: Pipeline, feedback: str, scenari
     않은 채 구현이 바로 시작돼버려 승인 게이트를 둔 의미가 없어진다.
     pipeline.instruction 자체는 보존하고(원본 PRD 유지) 이번 재작업 피드백만 덧붙인다.
 
-    scenario_key가 주어지고 실제 존재하는 Jira 이슈 키면, design 스테이지를
-    "이 키 하나만" 다시 만들도록 좁힌다(scenario_scope) — 그래서 design.outputs를
-    통째로 비우지 않는다(다른 시나리오들의 요약을 날리면 안 되므로). 없는
-    키거나 안 주어지면 예전처럼 스테이지 전체를 초기화한다."""
+    scenario_keys가 주어지고 그중 실제 존재하는 Jira 이슈 키가 하나 이상이면,
+    design 스테이지를 "이 키들만" 다시 만들도록 좁힌다(scenario_scope) — 그래서
+    design.outputs를 통째로 비우지 않는다(다른 시나리오들의 요약을 날리면 안
+    되므로). 존재하는 키가 하나도 없거나 안 주어지면 예전처럼 스테이지 전체를
+    초기화한다."""
     story_titles = project_jira.get(pipeline.project_id, {}).get("story_titles", {})
-    scoped = scenario_key is not None and scenario_key in story_titles
+    scoped_keys = [k for k in (scenario_keys or []) if k in story_titles]
+    scoped = bool(scoped_keys)
 
     design_stage = pipeline.stages["design"]
     design_stage.status = StageStatus.PENDING
@@ -933,7 +935,7 @@ async def _retry_design_with_feedback(pipeline: Pipeline, feedback: str, scenari
     # 정작 design 재작업 자체는 큐에 안 들어가는 버그가 생긴다.
     design_stage.approved = True
     if scoped:
-        design_stage.scenario_scope = [{"key": scenario_key, "title": story_titles[scenario_key]}]
+        design_stage.scenario_scope = [{"key": k, "title": story_titles[k]} for k in scoped_keys]
     else:
         design_stage.outputs = {}
         design_stage.scenario_scope = None
@@ -943,7 +945,7 @@ async def _retry_design_with_feedback(pipeline: Pipeline, feedback: str, scenari
         pipeline.stages[name].outputs = {}
     pipeline.stages["implement"].approved = False
 
-    tag = f"[디자인 재작업 요청 - {scenario_key}]" if scoped else "[디자인 재작업 요청]"
+    tag = f"[디자인 재작업 요청 - {', '.join(scoped_keys)}]" if scoped else "[디자인 재작업 요청]"
     pipeline.instruction += f"\n\n{tag} {feedback}"
     await advance_pipeline(pipeline)
 
@@ -1000,18 +1002,19 @@ _NO_BLIND_REVERT_GUIDANCE = (
 )
 
 
-async def _retry_implement_with_feedback(pipeline: Pipeline, feedback: str, scenario_key: str | None = None):
+async def _retry_implement_with_feedback(pipeline: Pipeline, feedback: str, scenario_keys: list[str] | None = None):
     """QA는 결과물(APK 등)을 받아서 테스트만 한다 — 테스트할 결과물 자체가
     없으면(pubspec.yaml 없음, 빌드 실패, APK 못 찾음 등 needs_rework) QA가
     직접 고치는 게 아니라 Implement에 구체적인 이유와 함께 재작업을 요청한다.
     pipeline.instruction 자체는 안 건드리고(다른 재실행에 영향 없게) 이번
     태스크에만 피드백을 덧붙여서 보낸다.
 
-    scenario_key가 주어지고 실제 존재하는 Jira 이슈 키면, 누적된 pipeline.instruction
-    전체 대신 "이 화면/기능만" 범위로 좁힌 instruction을 보낸다 — implement 컨테이너
-    (agents/implement_openhands/run.py)가 이 범위 제한 문구를 보고 design/applied의
-    다른 시나리오는 안 건드리도록 유도한다(강제는 아님 — OpenHands는 자유도 높은
-    코딩 에이전트라 프롬프트로 유도하는 것 이상은 못 함)."""
+    scenario_keys가 주어지고 그중 실제 존재하는 Jira 이슈 키가 하나 이상이면,
+    누적된 pipeline.instruction 전체 대신 "이 화면/기능들만" 범위로 좁힌
+    instruction을 보낸다 — implement 컨테이너(agents/implement_openhands/run.py)가
+    이 범위 제한 문구를 보고 design/applied의 다른 시나리오는 안 건드리도록
+    유도한다(강제는 아님 — OpenHands는 자유도 높은 코딩 에이전트라 프롬프트로
+    유도하는 것 이상은 못 함)."""
     pid = pipeline.project_id
     # 실패했던 브랜치를 기억해뒀다가 그대로 이어서 고치게 한다 — 지우기 전에 먼저 챙긴다.
     prior_branch = pipeline.stages["implement"].outputs.get("branch")
@@ -1032,13 +1035,16 @@ async def _retry_implement_with_feedback(pipeline: Pipeline, feedback: str, scen
         context["retry_branch"] = prior_branch
 
     story_titles = project_jira.get(pid, {}).get("story_titles", {})
-    scoped = scenario_key is not None and scenario_key in story_titles
+    scoped_keys = [k for k in (scenario_keys or []) if k in story_titles]
+    scoped = bool(scoped_keys)
 
     if scoped:
-        context["scenario_key"] = scenario_key
+        context["scenario_keys"] = scoped_keys
+        scope_desc = ", ".join(f"{k} - {story_titles[k]}" for k in scoped_keys)
+        files_desc = ", ".join(f"design/applied/{k}.html" for k in scoped_keys)
         instruction = (
-            f"[범위 제한: {scenario_key} - {story_titles[scenario_key]}] {feedback}\n\n"
-            f"design/applied/{scenario_key}.html에 해당하는 화면/기능만 반영하세요. "
+            f"[범위 제한: {scope_desc}] {feedback}\n\n"
+            f"{files_desc}에 해당하는 화면/기능만 반영하세요. "
             f"다른 화면/기능은 이미 반영돼 있으니 절대 건드리지 마세요.\n\n"
             f"{_NO_BLIND_REVERT_GUIDANCE}"
         )
@@ -1677,7 +1683,7 @@ async def retry_design(project_id: str, body: RetryFeedback):
     p = projects.get(project_id)
     if not p:
         raise HTTPException(404)
-    await _retry_design_with_feedback(p, body.feedback, body.scenario_key)
+    await _retry_design_with_feedback(p, body.feedback, [body.scenario_key] if body.scenario_key else None)
     return {"ok": True}
 
 
@@ -1702,15 +1708,15 @@ def _safe_design_key(key: str) -> bool:
     return bool(key) and "/" not in key and ".." not in key
 
 
-def _implement_jira_comment_targets(scenario_key: str | None, stories: list[str]) -> list[str]:
+def _implement_jira_comment_targets(scenario_keys: list[str] | None, stories: list[str]) -> list[str]:
     """구현 완료 코멘트/상태 전환을 어느 Jira 이슈(들)에 적용할지 결정한다 —
-    scenario_key로 범위가 좁혀졌고 실제 존재하는 이슈면 그 이슈 하나만, 아니면
-    (범위 제한 없음 또는 알 수 없는 키) 전체 스토리를 대상으로 한다. 예전엔
-    항상 stories[0] 하나에만 코멘트를 달아서, 두 번째 이후 이슈로 좁혀진
-    재작업의 PR 링크가 (이미 끝난) 첫 번째 이슈에 계속 쌓이는 문제가 있었다."""
-    if scenario_key and scenario_key in stories:
-        return [scenario_key]
-    return stories
+    scenario_keys로 범위가 좁혀졌고 그중 실제 존재하는 이슈가 있으면 그
+    이슈들만, 아니면(범위 제한 없음 또는 알 수 없는 키뿐) 전체 스토리를
+    대상으로 한다. 예전엔 항상 stories[0] 하나에만 코멘트를 달아서, 두 번째
+    이후 이슈로 좁혀진 재작업의 PR 링크가 (이미 끝난) 첫 번째 이슈에 계속
+    쌓이는 문제가 있었다."""
+    hits = [k for k in (scenario_keys or []) if k in stories]
+    return hits or stories
 
 
 def _scenarios_with_jira_issue(scenario_keys: list[str], story_keys) -> list[str]:
@@ -1888,12 +1894,19 @@ async def retry_implement(project_id: str, body: RetryFeedback):
     p = projects.get(project_id)
     if not p:
         raise HTTPException(404)
-    await _retry_implement_with_feedback(p, body.feedback, body.scenario_key)
+    await _retry_implement_with_feedback(p, body.feedback, [body.scenario_key] if body.scenario_key else None)
     return {"ok": True}
 
 
 class StageRerun(BaseModel):
     feedback: str = ""
+    # 지정하면 이 Jira 이슈 키들(예: ["ATM-5", "ATM-10"])만 재작업 — 없거나
+    # 비어 있으면 스테이지 전체(모든 시나리오)를 다시 돈다. recoveryfit에서
+    # 실제 재현: 플로우차트 탭 "Run"으로 화면 1개짜리 재작업을 돌렸는데 이
+    # 필드가 아예 없어서 매번 scenario_keys=None으로 넘어가 시나리오 8개가
+    # 전부 재생성됐다 — retry-design/retry-implement 엔드포인트는 이미
+    # scenario_key를 받는데 이 엔드포인트만 빠져 있었다.
+    scenario_keys: list[str] | None = None
 
 _RERUN_NO_CHANGE_TEXT = "(변경 없음 — 같은 내용으로 재실행)"
 
@@ -1911,9 +1924,9 @@ async def rerun_stage(project_id: str, stage_name: str, body: StageRerun):
     if stage_name == "planning":
         await _retry_planning_with_feedback(p, feedback, full_rewrite=False)
     elif stage_name == "design":
-        await _retry_design_with_feedback(p, feedback)
+        await _retry_design_with_feedback(p, feedback, body.scenario_keys)
     elif stage_name == "implement":
-        await _retry_implement_with_feedback(p, feedback)
+        await _retry_implement_with_feedback(p, feedback, body.scenario_keys)
     elif stage_name == "qa":
         await _retry_qa_with_feedback(p, body.feedback.strip())
     elif stage_name == "autotest":
