@@ -298,15 +298,34 @@ async def process_task(r: aioredis.Redis, task: dict):
         return
 
     if unresolved:
-        # MAX_SELF_FIX_ROUNDS를 다 써도 flutter analyze 에러가 안 없어졌다 —
-        # 커밋/푸시/PR을 진행하지 않고 여기서 멈춘다("성공해야 넘어가는거 아냐?").
-        # agents/base/agent.py의 build_stage_failed_event와 동일한 이벤트
-        # shape을 직접 구성해서 보낸다 — implement/qa/autotest는 그 헬퍼를
-        # 공유하지 않는 독립 빌드 컨텍스트라서.
+        # MAX_SELF_FIX_ROUNDS를 다 써도 flutter analyze 에러가 안 없어졌다 — PR은
+        # 열지 않고 멈춘다("성공해야 넘어가는거 아냐?"). 다만 지금까지 고친 내용을
+        # 그냥 버리면 사람이 "다시 실행"을 눌러도 매번 처음부터 다시 만들게 된다 —
+        # 브랜치에 커밋/푸시는 해둬서 다음 재실행이 이 브랜치를 이어받아 계속
+        # 고칠 수 있게 한다("재시작 카운트 끝나고 멈춰도 다시 이어서 실행").
+        run(["git", "add", "-A"], cwd=workspace)
+        run(["git", "commit", "-m", f"AI Implement (미해결 flutter analyze 에러): {instruction[:60]}"], cwd=workspace)
+        push = run(["git", "push", "-u", "origin", branch], cwd=workspace, timeout=120)
+        head_sha = run(["git", "rev-parse", "HEAD"], cwd=workspace).stdout.strip() if push.returncode == 0 else None
+        if push.returncode != 0:
+            await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                            "content": f"⚠️ 미해결 상태로 브랜치 push도 실패해서, 재실행 시 이 브랜치를 이어받지 못하고 새로 시작합니다: {push.stderr[:300]}"})
+
         await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
                         "content": f"❌ flutter analyze 에러를 {MAX_SELF_FIX_ROUNDS}라운드 안에 못 고쳤습니다 — 중단.\n{unresolved}"})
+        # agents/base/agent.py의 build_stage_failed_event와 동일한 이벤트 shape을
+        # 직접 구성해서 보낸다 — implement/qa/autotest는 그 헬퍼를 공유하지 않는
+        # 독립 빌드 컨텍스트라서. outputs.branch를 orchestrator(stage_failed
+        # 핸들러)가 stage.outputs로 저장해두면, 사람이 "다시 실행"을 눌렀을 때
+        # (_retry_implement_with_feedback) 새 브랜치를 만드는 대신 이 브랜치를
+        # 그대로 이어받아 지금까지의 작업 위에서 계속 고친다.
+        failed_outputs = {**token_usage}
+        if push.returncode == 0:
+            failed_outputs["branch"] = branch
+            if head_sha:
+                failed_outputs["head_sha"] = head_sha
         await emit(r, {"type": "stage_failed", "project_id": project_id, "agent": AGENT_NAME,
-                        "stage": stage, "error": unresolved})
+                        "stage": stage, "error": unresolved, "outputs": failed_outputs})
         return
 
     if ensure_ci_workflow(workspace):

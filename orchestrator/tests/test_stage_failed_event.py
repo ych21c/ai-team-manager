@@ -78,6 +78,49 @@ async def test_stage_failed_broadcasts_stage_update_and_chat_message(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_stage_failed_outputs_are_merged_for_later_resume(monkeypatch):
+    """implement가 flutter analyze 자동 수정 상한을 다 쓰고 멈출 때, 이미 push한
+    브랜치를 outputs.branch로 실어 보낸다 — _retry_implement_with_feedback가
+    이걸 읽어서 새 브랜치 대신 이 브랜치를 이어받는다("다시 이어서 실행")."""
+    p = Pipeline("p1", "PRD 원본")
+    p.mark_completed("planning", {})
+    p.mark_completed("design", {})
+    p.stages["implement"].approved = True
+    p.mark_running("implement")
+    monkeypatch.setattr(main, "projects", {"p1": p})
+
+    await main.handle_agent_event({
+        "type": "stage_failed", "project_id": "p1", "agent": "implement",
+        "stage": "implement", "error": "flutter analyze 에러 미해결",
+        "outputs": {"branch": "ai-implement/p1-abc123", "head_sha": "deadbeef", "input_tokens": 100},
+    })
+
+    outputs = p.stages["implement"].outputs
+    assert outputs["branch"] == "ai-implement/p1-abc123"
+    assert outputs["head_sha"] == "deadbeef"
+    assert outputs["input_tokens"] == 100
+    assert outputs["error"] == "flutter analyze 에러 미해결"
+
+
+@pytest.mark.asyncio
+async def test_stage_failed_without_outputs_key_still_works(monkeypatch):
+    """outputs를 안 보내는 기존 에이전트(pm/designer/architect/release)는
+    기존 동작 그대로 — event.get("outputs", {})가 빈 dict라 영향 없어야 한다."""
+    p = Pipeline("p1", "PRD 원본")
+    p.mark_completed("planning", {})
+    p.stages["design"].approved = True
+    p.mark_running("design")
+    monkeypatch.setattr(main, "projects", {"p1": p})
+
+    await main.handle_agent_event({
+        "type": "stage_failed", "project_id": "p1", "agent": "designer",
+        "stage": "design", "error": "boom",
+    })
+
+    assert p.stages["design"].outputs == {"agent": "designer", "error": "boom"}
+
+
+@pytest.mark.asyncio
 async def test_stage_failed_unknown_stage_name_is_ignored_not_crash(monkeypatch):
     """chat_triage는 Pipeline.stages에 없는 가짜 스테이지라 agent.py가 애초에
     stage_failed를 안 보내지만(호출부에서 걸러짐), 방어적으로 여기서도 모르는

@@ -535,7 +535,13 @@ async def handle_agent_event(event: dict):
         stage_name = event.get("stage")
         error = event.get("error", "알 수 없는 오류")
         if stage_name in pipeline.stages:
-            pipeline.mark_failed(stage_name, {"agent": agent_name, "error": error})
+            # implement가 flutter analyze 자동 수정 상한을 다 쓰고 실패로 멈출 때처럼,
+            # 이미 만든 브랜치/커밋을 그대로 이어서 고칠 수 있게 outputs를 실어 보낼
+            # 수 있다(예: {"branch": "..."}) — _retry_implement_with_feedback가
+            # stage.outputs["branch"]를 읽어 처음부터 다시 만들지 않고 그 브랜치를
+            # 이어받는다. 안 보내는 에이전트(pm/designer/architect/release)는
+            # event.get("outputs", {})가 빈 dict라 기존 동작과 동일하다.
+            pipeline.mark_failed(stage_name, {"agent": agent_name, "error": error, **event.get("outputs", {})})
             await broadcast({"type": "stage_update", "project_id": project_id, "stage": stage_name, "status": "failed"})
             await broadcast({
                 "type": "agent_message", "project_id": project_id, "agent": "system",
