@@ -653,6 +653,17 @@ _VERIFY_SCENARIOS_RULES = """당신은 Flutter QA 엔지니어입니다. 이 sys
 - 다른 설명 없이, 파일 전체를 ```dart 코드 블록 하나 안에만 출력하세요."""
 
 
+def _scenario_test_cmd(test_file: str) -> list[str]:
+    """integration_test 패키지 기반 테스트는 flutter-tester가 아니라 실제 Linux
+    데스크톱 앱으로 빌드되어 GTK 창을 띄우려 시도한다 — 컨테이너엔 디스플레이가
+    없어서 xvfb 없이 그냥 실행하면 빌드는 성공해놓고 "Error waiting for a debug
+    connection: The log reader stopped unexpectedly, or never started."로 실행만
+    항상 실패한다(recoveryfit에서 실제 재현: 하루 종일 모든 QA 라운드가 이걸로
+    실패해서 앱 코드가 맞았는지 틀렸는지조차 한 번도 확인 못 함). xvfb-run으로
+    가짜 디스플레이를 띄워서 GTK 창이 붙을 곳을 만들어준다."""
+    return ["xvfb-run", "-a", "flutter", "test", test_file]
+
+
 async def verify_scenarios(project_id: str, workspace: str, context: dict, instruction: str, already_passed: list[str]) -> dict:
     """이번 라운드에 실제로 요청된 범위(instruction)를 코드가 구현하고 있는지
     "실제로 실행해서" 검증한다. 예전엔 LLM이 소스 코드 텍스트를 읽고 "구현된
@@ -762,7 +773,7 @@ async def verify_scenarios(project_id: str, workspace: str, context: dict, instr
         f.write(code)
 
     ensure_integration_test_dependency(workspace)
-    result = run(["flutter", "test", SCENARIO_TEST_FILE], cwd=workspace, timeout=180)
+    result = run(_scenario_test_cmd(SCENARIO_TEST_FILE), cwd=workspace, timeout=180)
     detail = f"{result.stdout[-1500:]}\n{result.stderr[-500:]}".strip()
     if result.returncode == 0:
         return {"verdict": "pass", "covered": titles, "missing": [], "detail": detail}
