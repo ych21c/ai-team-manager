@@ -15,7 +15,20 @@ from run import (
     _filter_screenshot_paths, _extract_json_object, _finalize_qa_outputs,
     _resolve_target_branch, _extract_scenario_test_code,
     _list_source_files, SOURCE_TOTAL_EXCERPT_LIMIT, determine_build_command,
+    _VERIFY_SCENARIOS_RULES,
 )
+
+
+def test_rules_warn_against_pumpandsettle_with_repeating_animation():
+    # recoveryfit(c052dd6b)에서 실제로 재현된 사고: 스플래시 화면의 로딩 도트가
+    # AnimationController.repeat()으로 영원히 반복되는데, QA가 생성한 테스트가
+    # 그 화면에서 pumpAndSettle()을 써서 — 앱 코드가 맞아도 테스트가 원천적으로
+    # 통과 불가능한 상태로 몇 시간째 Implement에 "고쳐라"는 재작업 피드백만
+    # 반복해서 보냈다. 이 규칙 문구가 없으면 같은 사고가 다른 프로젝트/화면에서
+    # 재발한다.
+    assert "pumpAndSettle" in _VERIFY_SCENARIOS_RULES
+    assert ".repeat()" in _VERIFY_SCENARIOS_RULES
+    assert "tester.pump(Duration(" in _VERIFY_SCENARIOS_RULES
 
 
 def test_pubspec_package_name_extracted(tmp_path):
