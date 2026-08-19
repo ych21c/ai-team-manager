@@ -350,7 +350,11 @@ async def process_chat_triage(r: aioredis.Redis, task: dict):
 
     full_response = ""
     try:
-        client = anthropic.AsyncAnthropic(api_key=API_KEY)
+        # SDK 기본 타임아웃에만 기대지 않고 명시적으로 상한을 둔다 — recoveryfit에서
+        # 크레딧 소진 이후 요청이 예외도 안 던지고 응답도 안 오는 채로 20시간 넘게
+        # 멈춰있던 사고가 있었다(타임아웃이 없으면 이런 행이 절대 안 끝남). 가장 큰
+        # 산출물(MAX_TOKENS≈128000)도 스트리밍이라 20분이면 충분히 여유 있게 끝난다.
+        client = anthropic.AsyncAnthropic(api_key=API_KEY, timeout=1200.0)
         async with client.messages.stream(
             model=AGENT_MODELS.get("pm", MODEL),
             max_tokens=_SONNET_MAX,
@@ -566,7 +570,11 @@ async def process_task(r: aioredis.Redis, task: dict):
 
 {AGENT_ROLE}로서 산출물을 작성해주세요."""
 
-    client = anthropic.AsyncAnthropic(api_key=API_KEY)
+    # SDK 기본 타임아웃에만 기대지 않고 명시적으로 상한을 둔다 — recoveryfit에서
+    # 크레딧 소진 이후 요청이 예외도 안 던지고 응답도 안 오는 채로 20시간 넘게
+    # 멈춰있던 사고가 있었다(타임아웃이 없으면 이런 행이 절대 안 끝남). 가장 큰
+    # 산출물(MAX_TOKENS≈128000)도 스트리밍이라 20분이면 충분히 여유 있게 끝난다.
+    client = anthropic.AsyncAnthropic(api_key=API_KEY, timeout=1200.0)
     full_response = ""
     # 첫 user 턴에 캐시 브레이크포인트를 둔다 — max_tokens에 걸려 continuation을
     # 보낼 때마다(아래) 이 turn을 그대로 다시 포함시키는데, 마커가 없으면 매번
@@ -739,6 +747,23 @@ async def ensure_group(r: aioredis.Redis):
             raise
 
 
+def build_stage_failed_event(task: dict, agent_name: str, error: Exception) -> dict:
+    """process_task가 예외를 던졌을 때 orchestrator에 보고할 이벤트를 만든다.
+    예전엔 이 예외가 main()의 바깥 except에서 로컬 stderr로만 찍히고 끝나서,
+    orchestrator는 해당 스테이지가 실패한 줄도 모른 채 "running"으로 영원히
+    멈춰있었다(recoveryfit에서 크레딧 소진 에러 이후 20시간 넘게 방치된 채
+    재현됨 — 사람이 컨테이너 로그를 직접 뒤져야만 알 수 있었다). chat_triage는
+    Pipeline.stages에 실재하는 스테이지가 아니라 orchestrator가 stage_failed로
+    받으면 처리할 수 없으므로 호출하는 쪽에서 걸러야 한다."""
+    return {
+        "type": "stage_failed",
+        "project_id": task.get("project_id", ""),
+        "agent": agent_name,
+        "stage": task.get("stage"),
+        "error": str(error),
+    }
+
+
 async def main():
     if not API_KEY:
         print(f"[{AGENT_NAME}] ERROR: ANTHROPIC_API_KEY not set", file=sys.stderr)
@@ -755,7 +780,17 @@ async def main():
             )
             for _, messages in results:
                 for msg_id, fields in messages:
-                    await process_task(r, json.loads(fields["payload"]))
+                    task = json.loads(fields["payload"])
+                    try:
+                        await process_task(r, task)
+                    except Exception as e:
+                        print(f"[{AGENT_NAME}] '{task.get('stage')}' 처리 실패: {e}", file=sys.stderr)
+                        if task.get("stage") != "chat_triage":
+                            await emit(r, build_stage_failed_event(task, AGENT_NAME, e))
+                    # 성공이든(위) 위에서 이미 보고한 실패든 ack한다 — 예전엔 실패 시
+                    # ack을 안 해서 메시지가 pending에 영원히 남았지만(">"만 읽으므로
+                    # 재전달도 안 됨), 이제는 실패를 명시적으로 보고했으니 같은
+                    # 메시지를 다시 처리 시도할 이유가 없다.
                     await r.xack(STREAM_INBOX, GROUP_NAME, msg_id)
         except Exception as e:
             print(f"[{AGENT_NAME}] Error: {e}", file=sys.stderr)

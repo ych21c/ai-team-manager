@@ -525,6 +525,27 @@ async def handle_agent_event(event: dict):
 
         if stage_now_complete:
             await advance_pipeline(pipeline)
+    elif event_type == "stage_failed":
+        # agents/base/agent.py의 process_task가 예외를 던지면(크레딧 소진, 네트워크
+        # 에러 등) 예전엔 에이전트 로컬 로그에만 찍히고 orchestrator는 전혀 몰라서
+        # 스테이지가 "running"에 영원히 멈춰있었다(recoveryfit에서 20시간 넘게
+        # 방치된 채 재현됨 — 사람이 컨테이너 로그를 직접 뒤져야만 알 수 있었음).
+        # 이제 agent가 실패를 명시적으로 보고하면 즉시 실패로 반영해서 사람이
+        # 기다리지 않고 바로 재실행/폐기할 수 있게 한다.
+        stage_name = event.get("stage")
+        error = event.get("error", "알 수 없는 오류")
+        if stage_name in pipeline.stages:
+            pipeline.mark_failed(stage_name, {"agent": agent_name, "error": error})
+            await broadcast({"type": "stage_update", "project_id": project_id, "stage": stage_name, "status": "failed"})
+            await broadcast({
+                "type": "agent_message", "project_id": project_id, "agent": "system",
+                "content": f"❌ '{stage_name}' 실행 중 오류로 실패했습니다 ({agent_name}): {error}",
+            })
+            await _add_history(project_id, f"❌ '{stage_name}' 실패({agent_name}): {error}")
+            await broadcast({
+                "type": "project_updated", "project_id": project_id,
+                "projects": {project_id: _make_project_info(project_id)},
+            })
     elif event_type == "progress":
         await broadcast({
             "type": "agent_progress",

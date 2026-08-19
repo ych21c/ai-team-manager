@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import type { CSSProperties } from "react";
 import { reconcileApprovals } from "./reconcileApprovals";
 import { formatMessageTime } from "./formatTime";
-import { canDiscardStage, agentSubStatus } from "./flowchartRules";
+import { canDiscardStage, canCancelStage, agentSubStatus } from "./flowchartRules";
 
 // ── 타입 ──────────────────────────────────────────────────────────
 type AgentStatus = "pending" | "running" | "completed" | "failed" | "waiting_approval";
@@ -659,12 +659,20 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
   // 노드에서 바로 같은 입력으로 재실행하거나, 산출물을 폐기하고 이전 단계로
   // 되돌릴 수 있어야 한다 — 게이트 결정 블록은 "지금 막 도달한 게이트"에서만
   // 잠깐 보이고 사라지므로 그것만으론 부족하다.
-  const showInlineRerun = status === "completed";
+  // failed도 포함 — stage_failed 이벤트로 명시적으로 실패 보고된 스테이지가
+  // 재실행/폐기 버튼 하나 없는 막다른 골목이 되지 않게 한다.
+  const showInlineRerun = status === "completed" || status === "failed";
   const canDiscard = canDiscardStage(name, status);
+  const canCancel = canCancelStage(name, status);
   const isInlineEditing = !!editing[name];
 
   const handleDiscard = () => {
     if (!window.confirm(`'${meta.label}' 산출물을 폐기하고 이전 단계로 되돌릴까요? 이후 단계 산출물도 함께 사라집니다.`)) return;
+    onDiscard(name);
+  };
+
+  const handleCancel = () => {
+    if (!window.confirm(`'${meta.label}' 실행 중인 작업을 취소하고 이전 단계로 되돌릴까요? 에이전트 컨테이너 자체는 안 죽이므로, 살아있던 원래 작업이 나중에 뒤늦게 응답하면 그 사이 다시 실행한 결과를 덮어쓸 수 있습니다 — 토큰 소진 등으로 죽어서 멈춘 것 같을 때만 쓰세요.`)) return;
     onDiscard(name);
   };
 
@@ -733,7 +741,26 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
             <button onClick={onOpenDesign} style={{ ...flowBtnStyle, alignSelf: "flex-start", background: "#fff" }}>🎨 디자인 보기</button>
           )}
           {status === "running" && (
-            <AgentLogView projectId={projectId} agent={meta.agents[0]} live />
+            <>
+              {meta.agents.length > 1 ? (
+                // design처럼 에이전트 여럿(designer+architect)이 한 스테이지를 나눠 맡을
+                // 때 예전엔 meta.agents[0]만 보여줘서 architect 로그를 볼 방법이 아예
+                // 없었다 — 에이전트별로 각자 로그를 따로 보여준다.
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {meta.agents.map(a => (
+                    <AgentLogView key={a} projectId={projectId} agent={a} live />
+                  ))}
+                </div>
+              ) : (
+                <AgentLogView projectId={projectId} agent={meta.agents[0]} live />
+              )}
+              {canCancel && (
+                <button onClick={handleCancel} disabled={busy[name]}
+                  style={{ ...flowBtnStyle, alignSelf: "flex-start", background: "#FCEBEB", borderColor: "#F0C6C6", color: "#A32D2D" }}>
+                  ⏹ 취소
+                </button>
+              )}
+            </>
           )}
           {showInlineRerun && (
             isInlineEditing ? (
