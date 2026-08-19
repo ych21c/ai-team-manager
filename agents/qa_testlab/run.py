@@ -324,6 +324,27 @@ def _cap_gradle_memory(workspace: str):
         f.write("\n".join(lines) + "\n")
 
 
+# agents/autotest_ci/run.py의 동명 함수와 완전히 동일한 로직 — 각 에이전트가
+# 독립된 Docker 빌드 컨텍스트(자기 run.py만 COPY)라 공유 모듈 대신 그대로
+# 복제한다(_cap_gradle_memory와 같은 이유). Gradle/flutter build 실패 로그를
+# stdout/stderr 끝만 자르면(예전 방식) 실제 원인이 cleanup 출력 뒤에 묻혀
+# 잘려나가는 문제가 있었다 — error/warning/실패 줄과 문맥만 남긴다.
+_ISSUE_LINE_RE = re.compile(r"error|warning|exception|failed", re.IGNORECASE)
+_CONTEXT_LINES_AFTER = 2
+_MAX_FILTERED_CHARS = 3000
+
+
+def _extract_issue_lines(log_text: str) -> str:
+    lines = log_text.splitlines()
+    keep = [False] * len(lines)
+    for i, line in enumerate(lines):
+        if _ISSUE_LINE_RE.search(line):
+            for j in range(i, min(i + 1 + _CONTEXT_LINES_AFTER, len(lines))):
+                keep[j] = True
+    filtered = "\n".join(line for line, k in zip(lines, keep) if k)
+    return filtered[-_MAX_FILTERED_CHARS:]
+
+
 def build_instrumentation_apks(workspace: str) -> tuple[bool, str, str | None, str | None]:
     """SCENARIO_TEST_FILE(integration_test/scenario_test.dart)을 로컬 시뮬레이션
     (flutter test)뿐 아니라 실제 기기(Firebase Test Lab)에서도 돌리기 위한 앱/테스트
@@ -346,18 +367,18 @@ def build_instrumentation_apks(workspace: str) -> tuple[bool, str, str | None, s
 
     test_apk_build = run(["./gradlew", "app:assembleAndroidTest"], cwd=android_dir, timeout=600)
     if test_apk_build.returncode != 0:
-        return False, (
-            f"androidTest APK 빌드 실패:\n{test_apk_build.stdout[-800:]}\n{test_apk_build.stderr[-800:]}"
-        ), None, None
+        detail = _extract_issue_lines(f"{test_apk_build.stdout}\n{test_apk_build.stderr}") or \
+            f"{test_apk_build.stdout[-800:]}\n{test_apk_build.stderr[-800:]}"
+        return False, f"androidTest APK 빌드 실패:\n{detail}", None, None
 
     target_apk_build = run(
         ["./gradlew", "app:assembleDebug", f"-Ptarget={workspace}/{SCENARIO_TEST_FILE}"],
         cwd=android_dir, timeout=600,
     )
     if target_apk_build.returncode != 0:
-        return False, (
-            f"시나리오 진입점 앱 APK 빌드 실패:\n{target_apk_build.stdout[-800:]}\n{target_apk_build.stderr[-800:]}"
-        ), None, None
+        detail = _extract_issue_lines(f"{target_apk_build.stdout}\n{target_apk_build.stderr}") or \
+            f"{target_apk_build.stdout[-800:]}\n{target_apk_build.stderr[-800:]}"
+        return False, f"시나리오 진입점 앱 APK 빌드 실패:\n{detail}", None, None
 
     app_apk = f"{workspace}/build/app/outputs/apk/debug/app-debug.apk"
     test_apk = f"{workspace}/build/app/outputs/apk/androidTest/debug/app-debug-androidTest.apk"
@@ -1062,12 +1083,17 @@ async def process_task(r: aioredis.Redis, task: dict):
         run(["flutter", "pub", "get"], cwd=workspace, timeout=180)
         build = await run_streaming(build_cmd, workspace, 600, r, project_id, "APK 빌드")
         if build.returncode != 0:
-            error_excerpt = f"{build.stdout[-800:]}\n{build.stderr[-800:]}"
+            # 예전엔 stdout/stderr를 각각 800자로 자른 뒤 그 합친 문자열을 다시
+            # 뒤에서 1000자로 재슬라이스했다 — stderr만으로 1000자를 넘기면
+            # stdout 쪽 정보가 통째로 사라지는 복합 버그가 있었다. 필터는
+            # 자르기 전 원본 전체를 받아야 실제 에러 줄을 제대로 찾는다.
+            error_excerpt = _extract_issue_lines(f"{build.stdout}\n{build.stderr}") or \
+                f"{build.stdout[-800:]}\n{build.stderr[-800:]}"
             await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
                             "content": f"❌ APK 빌드 실패:\n{error_excerpt}"})
             await emit(r, {"type": "stage_completed", "project_id": project_id, "agent": AGENT_NAME, "stage": stage,
                             "outputs": {"agent": AGENT_NAME, "passed": False, "needs_rework": True,
-                                        "feedback": f"APK 빌드 실패. 이 에러를 고쳐서 다시 구현하세요:\n{error_excerpt[-1000:]}",
+                                        "feedback": f"APK 빌드 실패. 이 에러를 고쳐서 다시 구현하세요:\n{error_excerpt}",
                                         "summary": "APK 빌드 실패"}})
             return
 

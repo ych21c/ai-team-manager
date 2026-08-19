@@ -28,7 +28,7 @@ from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.task_tracker import TaskTrackerTool
 from openhands.tools.terminal import TerminalTool
 
-from build_apk import build_and_handoff_apk
+from build_apk import build_and_handoff_apk, _extract_issue_lines, _has_analyze_errors
 from git_workspace import run, ensure_git_workspace
 from prompt_helpers import mockup_guidance
 
@@ -37,6 +37,12 @@ AGENT_NAME   = "implement"
 API_KEY      = os.getenv("ANTHROPIC_API_KEY", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 LLM_MODEL    = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
+# OpenHands가 작업을 마쳤다고 보고해도 flutter analyze 에러가 남아있을 수 있어서
+# (프롬프트 지시는 강제가 아니라 권고일 뿐), 결정적으로 analyze→수정 라운드를
+# 돈다. 에이전트가 못 고치는 에러도 있을 수 있으니 무한 루프 방지용 상한이
+# 필요하다 — 사용자 확인: 10라운드, 다 써도 안 고쳐지면 진행하지 않고
+# stage_failed로 멈춘다("성공해야 넘어가는거 아냐?").
+MAX_SELF_FIX_ROUNDS = 10
 
 STREAM_INBOX  = f"agent:{AGENT_NAME}:inbox"
 STREAM_EVENTS = "orchestrator:events"
@@ -141,10 +147,12 @@ def ensure_ci_workflow(workspace: str) -> bool:
     return True
 
 
-def run_openhands_task(workspace: str, instruction: str, project_id: str, is_retry: bool, scenario_key: str | None = None) -> tuple[int, dict]:
+def run_openhands_task(workspace: str, instruction: str, project_id: str, is_retry: bool, scenario_key: str | None = None) -> tuple[int, dict, str]:
     """OpenHands Conversation을 (동기적으로) 실행. 블로킹 호출이므로 to_thread로 감싸서 호출한다.
     반환값의 두 번째 원소는 이번 실행의 토큰/비용(OpenHands SDK의 llm.metrics가 이미 누적
-    집계 — 플로우차트 탭 게이트에 표시하기 위함)."""
+    집계 — 플로우차트 탭 게이트에 표시하기 위함). 세 번째 원소는 MAX_SELF_FIX_ROUNDS를
+    다 써도 남아있는 flutter analyze 에러(성공 시 빈 문자열) — 호출부가 이걸로
+    커밋/PR 진행 여부를 결정한다."""
     llm = LLM(usage_id="implement", model=f"anthropic/{LLM_MODEL}", api_key=SecretStr(API_KEY))
     agent = Agent(
         llm=llm,
@@ -187,6 +195,29 @@ def run_openhands_task(workspace: str, instruction: str, project_id: str, is_ret
             f"git commit/push는 직접 하지 마세요 (다른 프로세스가 처리합니다)."
         )
         conversation.run()
+
+        # OpenHands에게 "flutter analyze/build 확인하고 고치라"고 프롬프트로
+        # 지시했지만 강제는 아니라 실제로 안 했을 수 있다 — 여기서 결정적으로
+        # analyze→수정 라운드를 돌려서 실제로 에러가 없어질 때까지(또는 상한
+        # 소진까지) 강제한다. send_message()는 conversation의 실행 상태를
+        # IDLE로 되돌리므로 같은 Conversation에서 반복 호출이 SDK가 의도한
+        # 멀티턴 사용법이고, llm.metrics는 Conversation 생애 동안 누적되므로
+        # 여러 라운드의 토큰/비용이 최종 token_usage에 그대로 합산된다.
+        unresolved = ""
+        for _ in range(MAX_SELF_FIX_ROUNDS):
+            analyze = run(["flutter", "analyze"], cwd=workspace, timeout=180)
+            analyze_text = f"{analyze.stdout}\n{analyze.stderr}"
+            if not _has_analyze_errors(analyze_text):
+                unresolved = ""
+                break
+            unresolved = _extract_issue_lines(analyze_text) or analyze_text[-2000:]
+            conversation.send_message(
+                f"`flutter analyze` 결과 아직 고쳐야 할 에러가 있습니다:\n{unresolved}\n"
+                f"위 에러를 고치세요."
+            )
+            conversation.run()
+        else:
+            unresolved = unresolved or "(원인 불명 — flutter analyze 반복 실패)"
     finally:
         conversation.close()
     usage = llm.metrics.accumulated_token_usage
@@ -195,7 +226,7 @@ def run_openhands_task(workspace: str, instruction: str, project_id: str, is_ret
         "output_tokens": usage.completion_tokens,
         "cost_usd":      llm.metrics.accumulated_cost,
     }
-    return len(events), token_usage
+    return len(events), token_usage, unresolved
 
 
 async def process_task(r: aioredis.Redis, task: dict):
@@ -258,12 +289,24 @@ async def process_task(r: aioredis.Redis, task: dict):
                     "content": f"🤖 OpenHands 실행 중... (브랜치: {branch})"})
 
     try:
-        event_count, token_usage = await asyncio.to_thread(run_openhands_task, workspace, instruction, project_id, bool(retry_branch), scenario_key)
+        event_count, token_usage, unresolved = await asyncio.to_thread(run_openhands_task, workspace, instruction, project_id, bool(retry_branch), scenario_key)
         await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
                         "content": f"✅ OpenHands 작업 완료 ({event_count}개 이벤트)"})
     except Exception as e:
         await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
                         "content": f"❌ OpenHands 실행 오류: {e}"})
+        return
+
+    if unresolved:
+        # MAX_SELF_FIX_ROUNDS를 다 써도 flutter analyze 에러가 안 없어졌다 —
+        # 커밋/푸시/PR을 진행하지 않고 여기서 멈춘다("성공해야 넘어가는거 아냐?").
+        # agents/base/agent.py의 build_stage_failed_event와 동일한 이벤트
+        # shape을 직접 구성해서 보낸다 — implement/qa/autotest는 그 헬퍼를
+        # 공유하지 않는 독립 빌드 컨텍스트라서.
+        await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                        "content": f"❌ flutter analyze 에러를 {MAX_SELF_FIX_ROUNDS}라운드 안에 못 고쳤습니다 — 중단.\n{unresolved}"})
+        await emit(r, {"type": "stage_failed", "project_id": project_id, "agent": AGENT_NAME,
+                        "stage": stage, "error": unresolved})
         return
 
     if ensure_ci_workflow(workspace):

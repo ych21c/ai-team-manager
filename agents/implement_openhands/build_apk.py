@@ -7,11 +7,43 @@ git_workspace.py/prompt_helpers.py와 같은 이유로 별도 모듈로 뽑아�
 테스트할 수 있게 한다.
 """
 import os
+import re
 import shutil
 
 from git_workspace import run
 
 ARTIFACT_APK_NAME = "app-debug.apk"
+
+# agents/autotest_ci/run.py, agents/qa_testlab/run.py의 동명 함수와 완전히
+# 동일한 로직 — 각 에이전트가 독립된 Docker 빌드 컨텍스트(자기 파일만 COPY)라
+# 공유 모듈 대신 그대로 복제한다. 로그 끝만 자르면 실제 원인이 cleanup 출력
+# 뒤에 묻혀 잘려나가는 문제가 있어서, error/warning/실패 줄과 문맥만 남긴다.
+_ISSUE_LINE_RE = re.compile(r"error|warning|exception|failed", re.IGNORECASE)
+_CONTEXT_LINES_AFTER = 2
+_MAX_FILTERED_CHARS = 3000
+
+
+def _extract_issue_lines(log_text: str) -> str:
+    lines = log_text.splitlines()
+    keep = [False] * len(lines)
+    for i, line in enumerate(lines):
+        if _ISSUE_LINE_RE.search(line):
+            for j in range(i, min(i + 1 + _CONTEXT_LINES_AFTER, len(lines))):
+                keep[j] = True
+    filtered = "\n".join(line for line, k in zip(lines, keep) if k)
+    return filtered[-_MAX_FILTERED_CHARS:]
+
+
+# flutter analyze 사람이 읽는 기본 출력 형식은 "  error • 메시지 • 파일:줄:칸 • 규칙"
+# 처럼 줄 앞에 severity 토큰이 붙는다. Implement 자동 수정 루프는 "에러만" 잡고
+# 워닝은 무시하도록(사용자 확인) 이 토큰으로 정확히 구분한다 — _extract_issue_lines의
+# 넓은 error|warning|exception|failed 매칭은 피드백 텍스트를 만들 때만 쓰고,
+# 루프를 계속할지 판단하는 건 이 함수로 한다.
+_ANALYZE_ERROR_LINE_RE = re.compile(r"^\s*error\s*•", re.MULTILINE)
+
+
+def _has_analyze_errors(analyze_output: str) -> bool:
+    return bool(_ANALYZE_ERROR_LINE_RE.search(analyze_output))
 
 
 def _cap_gradle_memory(workspace: str):
@@ -64,7 +96,9 @@ def build_and_handoff_apk(workspace: str, project_id: str, artifacts_root: str =
 
     build = run(["flutter", "build", "apk", "--debug"], cwd=workspace, timeout=600)
     if build.returncode != 0:
-        return False, f"flutter build apk 실패:\n{build.stdout[-800:]}\n{build.stderr[-800:]}", None
+        detail = _extract_issue_lines(f"{build.stdout}\n{build.stderr}") or \
+            f"{build.stdout[-800:]}\n{build.stderr[-800:]}"
+        return False, f"flutter build apk 실패:\n{detail}", None
 
     found = run(["find", f"{workspace}/build/app/outputs/flutter-apk", "-name", "*.apk"], cwd=workspace, timeout=10)
     apk_candidates = found.stdout.strip().splitlines()

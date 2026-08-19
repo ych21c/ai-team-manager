@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import build_apk
-from build_apk import ARTIFACT_APK_NAME, build_and_handoff_apk
+from build_apk import ARTIFACT_APK_NAME, build_and_handoff_apk, _extract_issue_lines, _has_analyze_errors
 
 
 class _FakeCompletedProcess:
@@ -168,3 +168,40 @@ def test_gradle_memory_cap_applied_before_build(tmp_path, monkeypatch):
     assert len(seen_jvmargs_at_build_time) == 1
     assert "org.gradle.jvmargs=-Xmx1536m" in seen_jvmargs_at_build_time[0]
     assert "org.gradle.daemon=false" in seen_jvmargs_at_build_time[0]
+
+
+def test_extract_issue_lines_keeps_analyzer_error_drops_noise():
+    log = "\n".join([
+        "2024-01-01T00:00:00Z Run flutter pub get",
+        "2024-01-01T00:00:00Z Resolving dependencies...",
+        "2024-01-01T00:00:00Z Downloading packages...",
+        "2024-01-01T00:00:00Z Analyzing project...",
+        "  error • lib/main.dart:10:5 • Undefined name 'foo' • undefined_identifier",
+        "2024-01-01T00:00:00Z 1 issue found.",
+        "2024-01-01T00:00:00Z Post job cleanup.",
+        "2024-01-01T00:00:00Z Saving cache...",
+    ])
+    filtered = _extract_issue_lines(log)
+    assert "Undefined name 'foo'" in filtered
+    assert "Resolving dependencies" not in filtered
+    assert "Saving cache" not in filtered
+
+
+def test_extract_issue_lines_empty_when_no_match():
+    assert _extract_issue_lines("all good, nothing to see here\nstill fine") == ""
+
+
+def test_has_analyze_errors_true_for_error_line():
+    output = "  error • Undefined name 'foo'. • lib/main.dart:10:5 • undefined_identifier\n1 issue found."
+    assert _has_analyze_errors(output) is True
+
+
+def test_has_analyze_errors_false_for_warning_only():
+    """구현 자동 수정 루프는 에러만 잡고 워닝은 무시한다(사용자 확인) — 워닝만
+    있을 때 루프가 계속 돌면 안 된다."""
+    output = "  warning • Unused import: 'dart:io'. • lib/main.dart:2:8 • unused_import\n1 issue found."
+    assert _has_analyze_errors(output) is False
+
+
+def test_has_analyze_errors_false_for_clean_output():
+    assert _has_analyze_errors("No issues found!") is False
