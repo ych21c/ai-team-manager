@@ -50,6 +50,18 @@ def test_rules_warn_against_referencing_unimported_screen_classes():
     assert "find.byType(SplashScreen)" in _VERIFY_SCENARIOS_RULES
 
 
+def test_rules_warn_against_blindly_importing_main_dart():
+    # recoveryfit에서 실제 재현: main.dart엔 `void main() { runApp(...) }`만 있고
+    # App 위젯 클래스(RecoveryFitApp)는 별도 app.dart에 정의돼 있었는데, 규칙이
+    # "main.dart를 반드시 import하라"고 못박아놔서 생성된 테스트가 main.dart를
+    # import했고, Dart는 import를 전이적으로 재노출하지 않으므로
+    # "Couldn't find constructor 'RecoveryFitApp'"로 컴파일이 실패했다.
+    assert "main.dart" in _VERIFY_SCENARIOS_RULES
+    assert "app.dart" in _VERIFY_SCENARIOS_RULES
+    assert "runApp(" in _VERIFY_SCENARIOS_RULES
+    assert "재노출" in _VERIFY_SCENARIOS_RULES
+
+
 def test_rules_warn_against_joined_text_when_source_splits_lines():
     # recoveryfit에서 실제 재현: 헤드라인이 소스에서 Text('첫줄')/Text('둘째줄')로 두
     # 위젯에 나뉘어 있는데, 생성된 테스트는 find.text('첫줄\\n둘째줄')로 합쳐서 찾아서

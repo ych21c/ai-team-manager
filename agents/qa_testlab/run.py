@@ -617,11 +617,20 @@ _VERIFY_SCENARIOS_RULES = """당신은 Flutter QA 엔지니어입니다. 이 sys
 
 규칙:
 - `package:flutter/material.dart`, `package:flutter_test/flutter_test.dart`,
-  `package:integration_test/integration_test.dart`, 그리고 이 프로젝트의 main.dart(정확한
-  패키지 이름은 "이 프로젝트의 Flutter 패키지 이름" 블록 참고)를 반드시 import하세요 —
-  material.dart가 없으면 Scaffold/Column/ElevatedButton 같은 기본 위젯 이름을 못 찾아
-  컴파일이 실패합니다. integration_test는 이 테스트를 로컬 시뮬레이션뿐 아니라 나중에
-  실제 기기(Firebase Test Lab)에서도 그대로 돌리기 위해 반드시 필요합니다.
+  `package:integration_test/integration_test.dart`를 반드시 import하세요 — material.dart가
+  없으면 Scaffold/Column/ElevatedButton 같은 기본 위젯 이름을 못 찾아 컴파일이 실패합니다.
+  integration_test는 이 테스트를 로컬 시뮬레이션뿐 아니라 나중에 실제 기기(Firebase Test
+  Lab)에서도 그대로 돌리기 위해 반드시 필요합니다.
+- `tester.pumpWidget(...)`에 넘길 최상위 App 위젯(보통 `MaterialApp`을 감싸는
+  `FooApp`/`MyApp` 같은 클래스)은 `main.dart`가 아니라 **그 클래스가 실제로 정의된
+  파일**을 import하세요 — 많은 프로젝트가 `main.dart`엔 `void main() { runApp(...) }`만
+  두고 App 위젯 클래스 자체는 `app.dart` 등 별도 파일에 정의합니다. Dart의 `import`는
+  전이적으로 재노출되지 않으므로(`export`가 아닌 한) `main.dart`만 import하면 그 안에서
+  `import`한 클래스를 테스트에서 못 찾아 "Couldn't find constructor 'FooApp'"로 컴파일이
+  실패합니다(recoveryfit에서 실제 재현: main.dart는 app.dart의 RecoveryFitApp을 import만
+  했을 뿐인데 테스트가 main.dart를 import해서 실패). 제공된 소스에서 `runApp(...)`에
+  전달되는 클래스명을 확인하고, 그 클래스가 `class` 선언으로 정의된 실제 파일의 패키지
+  경로(정확한 패키지 이름은 "이 프로젝트의 Flutter 패키지 이름" 블록 참고)를 import하세요.
 - `main()` 함수의 첫 줄은 반드시 `IntegrationTestWidgetsFlutterBinding.ensureInitialized();`
   여야 합니다 — 이게 없으면 실제 기기에서 실행할 때 테스트가 즉시 실패합니다.
 - 시나리오 하나당 `testWidgets('사용자 관점 시나리오 이름', (tester) async { ... })` 하나.
