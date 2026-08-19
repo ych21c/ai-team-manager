@@ -671,8 +671,14 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
     onDiscard(name);
   };
 
-  const handleCancel = () => {
-    if (!window.confirm(`'${meta.label}' 실행 중인 작업을 취소하고 이전 단계로 되돌릴까요? 이미 끝낸 에이전트의 결과물은 보존되고, 아직 안 끝난 에이전트만 다음 승인 때 다시 실행됩니다. (단, 에이전트 컨테이너 자체는 안 죽이므로 원래 작업이 살아있다가 나중에 뒤늦게 응답하면 다시 실행한 결과를 덮어쓸 수 있습니다 — 토큰 소진 등으로 죽어서 멈춘 것 같을 때만 쓰세요.)`)) return;
+  // agentLabel을 주면(에이전트별 취소 버튼에서 호출) 확인 문구에 어느 에이전트를
+  // 취소하는지 보여준다 — 실제 취소 대상은 항상 스테이지 전체지만(design은
+  // designer/architect가 한 Stage를 공유), 서버(_cancel_running_stage)가 이미
+  // 끝난 다른 에이전트의 산출물은 보존하고 재승인 시 안 끝난 쪽에만 새 태스크를
+  // 보내므로 실질적으로는 "이 에이전트만 다시 시킨다"와 같은 효과다.
+  const handleCancel = (agentLabel?: string) => {
+    const target = agentLabel ? `${meta.label} — ${agentLabel}` : meta.label;
+    if (!window.confirm(`'${target}' 실행 중인 작업을 취소하고 다시 시킬까요? 이미 끝낸 에이전트의 결과물은 보존되고, 아직 안 끝난 에이전트만 다음 승인 때 다시 실행됩니다. (단, 에이전트 컨테이너 자체는 안 죽이므로 원래 작업이 살아있다가 나중에 뒤늦게 응답하면 다시 실행한 결과를 덮어쓸 수 있습니다 — 토큰 소진 등으로 죽어서 멈춘 것 같을 때만 쓰세요.)`)) return;
     onDiscard(name);
   };
 
@@ -714,7 +720,15 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
                         <span style={{ width: 6, height: 6, borderRadius: "50%", background: aMeta.bg, border: `1.5px solid ${aMeta.color}`, display: "inline-block" }} />
                         {aMeta.label}
                       </span>
-                      <StatusBadge status={aStatus} />
+                      <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <StatusBadge status={aStatus} />
+                        {aStatus === "running" && canCancel && (
+                          <button onClick={() => handleCancel(aMeta.label)} disabled={busy[name]}
+                            style={{ fontSize: 10.5, padding: "2px 7px", borderRadius: 5, border: "0.5px solid #F0C6C6", background: "#FCEBEB", color: "#A32D2D", cursor: "pointer" }}>
+                            ⏹ 취소
+                          </button>
+                        )}
+                      </span>
                     </div>
                     {aSummary && (
                       <div style={{ fontSize: 11.5, lineHeight: 1.5, color: "#555", marginTop: 4, maxHeight: 120, overflow: "auto", whiteSpace: "pre-wrap" }}>
@@ -754,8 +768,11 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
               ) : (
                 <AgentLogView projectId={projectId} agent={meta.agents[0]} live />
               )}
-              {canCancel && (
-                <button onClick={handleCancel} disabled={busy[name]}
+              {/* 에이전트가 여럿인 스테이지(design)는 위 per-agent 카드에 각자 취소
+                  버튼이 있으니 여기서 또 스테이지 전체용 버튼을 안 보여준다 —
+                  "이건 뭘 취소하는 거지" 하는 혼란을 피하기 위함. */}
+              {canCancel && meta.agents.length <= 1 && (
+                <button onClick={() => handleCancel()} disabled={busy[name]}
                   style={{ ...flowBtnStyle, alignSelf: "flex-start", background: "#FCEBEB", borderColor: "#F0C6C6", color: "#A32D2D" }}>
                   ⏹ 취소
                 </button>
