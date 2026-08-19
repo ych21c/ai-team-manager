@@ -23,7 +23,8 @@ interface Message {
   id: string; from: string; content: string; ts: number; video?: string;
 }
 interface JiraInfo {
-  epic?: string; stories?: string[]; confluence_url?: string; jira_url?: string;
+  epic?: string; stories?: string[]; story_titles?: Record<string, string>;
+  confluence_url?: string; jira_url?: string;
 }
 interface StageTokenTotal { input_tokens: number; output_tokens: number; cost_usd: number; }
 interface TokenTotals {
@@ -593,22 +594,65 @@ const flowBtnStyle: CSSProperties = {
   padding: "6px 12px", fontSize: 12, borderRadius: 6, cursor: "pointer", border: "0.5px solid #e5e5e5",
 };
 
-function DecisionBlock({ editTarget, gateTarget, stages, draft, setDraft, editing, setEditing, busy, onRun, onDiscard, onApprove }: {
+// design/implement는 시나리오(Jira 이슈)별로 화면이 여러 개라 스코프를 안 주면
+// 프로젝트의 시나리오 전체를 다시 돈다 — recoveryfit에서 화면 1개 재작업 요청이
+// 시나리오 8개 전체 재생성으로 번진 사고 재발 방지용 체크박스 목록. 기본은
+// "전체 선택"(=오늘까지의 기본 동작과 동일)이고, 사용자가 체크를 해제해서
+// 범위를 좁힌다 — 처음부터 빈 목록으로 시작하면 매번 일일이 골라야 해서
+// "영향받는 이슈는 기본으로 선택돼 있어야" 한다는 요구에 어긋난다.
+function ScenarioScopePicker({ jira, selected, onChange }: {
+  jira?: JiraInfo; selected: string[]; onChange: (keys: string[]) => void;
+}) {
+  const stories = jira?.stories ?? [];
+  const touchedRef = useRef(false);
+  useEffect(() => {
+    if (!touchedRef.current && stories.length > 0 && selected.length === 0) onChange(stories);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stories.length]);
+
+  if (stories.length === 0) return null;
+
+  const toggle = (key: string) => {
+    touchedRef.current = true;
+    onChange(selected.includes(key) ? selected.filter(k => k !== key) : [...selected, key]);
+  };
+
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: "#888", marginBottom: 4 }}>범위 지정 (기본 전체 선택 — 체크 해제해서 좁히세요)</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 3, maxHeight: 140, overflowY: "auto", border: "0.5px solid #e5e5e5", borderRadius: 6, padding: "6px 8px" }}>
+        {stories.map(key => (
+          <label key={key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer" }}>
+            <input type="checkbox" checked={selected.includes(key)} onChange={() => toggle(key)} />
+            <span style={{ fontFamily: "monospace", color: "#666" }}>{key}</span>
+            <span style={{ color: "#999" }}>{jira?.story_titles?.[key] ?? ""}</span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// 체크박스 전부 선택(=오늘까지의 기본 "전체 재작업")이거나 하나도 선택 안 했으면
+// 스코프 없음(undefined)으로 보내고, 일부만 선택했을 때만 실제로 좁힌다.
+function resolveScenarioKeys(selected: string[], totalCount: number): string[] | undefined {
+  return selected.length > 0 && selected.length < totalCount ? selected : undefined;
+}
+
+function DecisionBlock({ editTarget, gateTarget, stages, jira, draft, setDraft, editing, setEditing, busy, onRun, onDiscard, onApprove }: {
   editTarget: StageName; gateTarget: StageName; stages: Record<string, StageInfo> | undefined;
+  jira?: JiraInfo;
   draft: Record<string, string>; setDraft: (fn: (d: Record<string, string>) => Record<string, string>) => void;
   editing: Record<string, boolean>; setEditing: (fn: (d: Record<string, boolean>) => Record<string, boolean>) => void;
   busy: Record<string, boolean>;
-  onRun: (stage: string, feedback: string, scenarioKey?: string) => void;
+  onRun: (stage: string, feedback: string, scenarioKeys?: string[]) => void;
   onDiscard: (stage: string) => void;
   onApprove: (stage: string, extraInput?: string) => void;
 }) {
   const [extra, setExtra] = useState("");
-  const [scenarioKey, setScenarioKey] = useState("");
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const isEditing = !!editing[editTarget];
   const editOutputs = stages?.[editTarget]?.outputs;
-  // design/implement는 시나리오(Jira 이슈)별로 화면이 여러 개라 스코프를 안 주면
-  // 프로젝트의 시나리오 전체를 다시 돈다 — recoveryfit에서 화면 1개 재작업 요청이
-  // 시나리오 8개 전체 재생성으로 번진 사고 재발 방지.
   const scopable = editTarget === "design" || editTarget === "implement";
 
   if (isEditing) {
@@ -618,18 +662,11 @@ function DecisionBlock({ editTarget, gateTarget, stages, draft, setDraft, editin
         <textarea value={draft[editTarget] ?? ""} onChange={e => setDraft(d => ({ ...d, [editTarget]: e.target.value }))}
           rows={3} placeholder="예: 버튼 색상이 스펙과 달라요"
           style={{ width: "100%", padding: "8px 10px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12.5, fontFamily: "inherit", resize: "vertical", boxSizing: "border-box" }} />
-        {scopable && (
-          <div>
-            <div style={{ fontSize: 11, color: "#888", marginBottom: 4 }}>범위 지정할 Jira 이슈 (선택 — 비우면 전체 시나리오 재작업)</div>
-            <input value={scenarioKey} onChange={e => setScenarioKey(e.target.value)}
-              placeholder="예: ATM-5"
-              style={{ width: "100%", padding: "6px 8px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12.5, boxSizing: "border-box" }} />
-          </div>
-        )}
+        {scopable && <ScenarioScopePicker jira={jira} selected={selectedKeys} onChange={setSelectedKeys} />}
         <div style={{ display: "flex", gap: 6 }}>
           <button onClick={() => setEditing(v => ({ ...v, [editTarget]: false }))}
             style={{ ...flowBtnStyle, background: "#f5f4f0", color: "#666" }}>취소</button>
-          <button onClick={() => onRun(editTarget, draft[editTarget] ?? "", scenarioKey)} disabled={busy[editTarget]}
+          <button onClick={() => onRun(editTarget, draft[editTarget] ?? "", resolveScenarioKeys(selectedKeys, jira?.stories?.length ?? 0))} disabled={busy[editTarget]}
             style={{ ...flowBtnStyle, background: "#7F77DD", border: "none", color: "#fff", fontWeight: 500 }}>
             {busy[editTarget] ? "실행 중..." : "▶ Run"}
           </button>
@@ -658,17 +695,17 @@ function DecisionBlock({ editTarget, gateTarget, stages, draft, setDraft, editin
   );
 }
 
-function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpand, onOpenDesign,
+function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpand, onOpenDesign, jira,
                     editing, onStartEdit, onCancelEdit, draft, setDraft, busy, onRun, onDiscard }: {
   name: StageName; stageInfo?: StageInfo; projectId: string; isActive: boolean;
-  expanded: boolean; onToggleExpand: () => void; onOpenDesign: () => void;
+  expanded: boolean; onToggleExpand: () => void; onOpenDesign: () => void; jira?: JiraInfo;
   editing: Record<string, boolean>; onStartEdit: (stage: string) => void; onCancelEdit: (stage: string) => void;
   draft: Record<string, string>;
   setDraft: (fn: (d: Record<string, string>) => Record<string, string>) => void;
-  busy: Record<string, boolean>; onRun: (stage: string, feedback: string, scenarioKey?: string) => void;
+  busy: Record<string, boolean>; onRun: (stage: string, feedback: string, scenarioKeys?: string[]) => void;
   onDiscard: (stage: string) => void;
 }) {
-  const [scenarioKey, setScenarioKey] = useState("");
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const scopable = name === "design" || name === "implement";
   const meta = STAGE_META[name];
   const agentMeta = AGENT_META[meta.agents[0]] ?? { label: meta.label, color: "#666", bg: "#f0f0f0" };
@@ -803,15 +840,11 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 <textarea value={draft[name] ?? ""} onChange={e => setDraft(d => ({ ...d, [name]: e.target.value }))}
                   rows={2} placeholder="재작업 요청 내용 (비워두면 같은 입력으로 재실행)" style={{ width: "100%", padding: "6px 8px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12, fontFamily: "inherit", boxSizing: "border-box" }} />
-                {scopable && (
-                  <input value={scenarioKey} onChange={e => setScenarioKey(e.target.value)}
-                    placeholder="범위 지정할 Jira 이슈 (선택 — 예: ATM-5, 비우면 전체 시나리오 재작업)"
-                    style={{ width: "100%", padding: "6px 8px", border: "0.5px solid #d5d5d5", borderRadius: 6, fontSize: 12, boxSizing: "border-box" }} />
-                )}
+                {scopable && <ScenarioScopePicker jira={jira} selected={selectedKeys} onChange={setSelectedKeys} />}
                 <div style={{ display: "flex", gap: 6 }}>
                   <button onClick={() => onCancelEdit(name)}
                     style={{ ...flowBtnStyle, background: "#f5f4f0", color: "#666" }}>취소</button>
-                  <button onClick={() => onRun(name, draft[name] ?? "", scenarioKey)} disabled={busy[name]}
+                  <button onClick={() => onRun(name, draft[name] ?? "", resolveScenarioKeys(selectedKeys, jira?.stories?.length ?? 0))} disabled={busy[name]}
                     style={{ ...flowBtnStyle, background: "#7F77DD", border: "none", color: "#fff" }}>
                     {busy[name] ? "실행 중..." : "▶ Run"}
                   </button>
@@ -876,8 +909,8 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
     }
   };
 
-  const runStage = (stage: string, feedback: string, scenarioKey?: string) => withBusy(stage, async () => {
-    await post(`/projects/${projectId}/stage/${stage}/rerun`, { feedback, scenario_key: scenarioKey?.trim() || null });
+  const runStage = (stage: string, feedback: string, scenarioKeys?: string[]) => withBusy(stage, async () => {
+    await post(`/projects/${projectId}/stage/${stage}/rerun`, { feedback, scenario_keys: scenarioKeys?.length ? scenarioKeys : null });
     setEditing(v => ({ ...v, [stage]: false }));
   });
   const discardStage = (stage: string) => withBusy(stage, () => post(`/projects/${projectId}/stage/${stage}/discard`));
@@ -937,7 +970,7 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
               name={name} stageInfo={stages?.[name]} projectId={projectId}
               isActive={name === activeGate || (nextGated && next === activeGate)}
               expanded={isExpanded(name)} onToggleExpand={() => setExpanded(v => ({ ...v, [name]: !isExpanded(name) }))}
-              onOpenDesign={onOpenDesign}
+              onOpenDesign={onOpenDesign} jira={project?.jira}
               editing={editing} onStartEdit={n => setEditing(v => ({ ...v, [n]: true }))}
               onCancelEdit={n => setEditing(v => ({ ...v, [n]: false }))}
               draft={draft} setDraft={setDraft} busy={busy}
@@ -946,7 +979,7 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
             {next && (
               showGate ? (
                 <DecisionBlock
-                  editTarget={name} gateTarget={next} stages={stages}
+                  editTarget={name} gateTarget={next} stages={stages} jira={project?.jira}
                   draft={draft} setDraft={setDraft} editing={editing} setEditing={setEditing} busy={busy}
                   onRun={runStage} onDiscard={discardStage} onApprove={approveStage}
                 />

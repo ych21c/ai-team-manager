@@ -47,7 +47,7 @@ async def test_scoped_retry_narrows_instruction_and_marks_scenario_key(monkeypat
     p = Pipeline("p1", "PRD: 전체 앱 요구사항 아주 길게...")
     p.mark_completed("implement", {"branch": "some-branch"})
 
-    await main._retry_implement_with_feedback(p, "로고가 이상함", "ATM-5")
+    await main._retry_implement_with_feedback(p, "로고가 이상함", ["ATM-5"])
 
     instruction = sent["instruction"]
     assert "[범위 제한: ATM-5 - 로그인 화면]" in instruction
@@ -57,7 +57,32 @@ async def test_scoped_retry_narrows_instruction_and_marks_scenario_key(monkeypat
     assert "전체 앱 요구사항" not in instruction
     # git log 먼저 확인하라는 가드레일은 스코프 여부와 무관하게 항상 포함
     assert "git log" in instruction
-    assert sent["context"]["scenario_key"] == "ATM-5"
+    assert sent["context"]["scenario_keys"] == ["ATM-5"]
+
+
+async def test_scoped_retry_with_multiple_keys_narrows_instruction_to_all(monkeypatch):
+    """멀티선택 — 여러 화면을 같이 지정하면 instruction/context에 둘 다 반영돼야
+    한다(첫 번째 키만 반영되던 회귀 방지)."""
+    monkeypatch.setattr(main, "project_jira", {"p1": {"story_titles": {
+        "ATM-5": "로그인 화면", "ATM-10": "시작 화면",
+    }}})
+    sent = {}
+
+    async def _fake_send_task(agent_name, pid, task):
+        sent.update(task)
+
+    monkeypatch.setattr(main.redis, "send_task", _fake_send_task)
+
+    p = Pipeline("p1", "PRD: 전체 앱 요구사항 아주 길게...")
+    p.mark_completed("implement", {"branch": "some-branch"})
+
+    await main._retry_implement_with_feedback(p, "화면 2개 같이 손봄", ["ATM-5", "ATM-10"])
+
+    instruction = sent["instruction"]
+    assert "[범위 제한: ATM-5 - 로그인 화면, ATM-10 - 시작 화면]" in instruction
+    assert "design/applied/ATM-5.html" in instruction
+    assert "design/applied/ATM-10.html" in instruction
+    assert sent["context"]["scenario_keys"] == ["ATM-5", "ATM-10"]
 
 
 async def test_unscoped_retry_is_byte_identical_to_before(monkeypatch):
@@ -84,7 +109,7 @@ async def test_unscoped_retry_is_byte_identical_to_before(monkeypatch):
     assert "되돌리지 마세요" in instruction
     assert "ElevatedButton을 못 찾음" in instruction
     assert "범위 제한" not in instruction
-    assert "scenario_key" not in sent["context"]
+    assert "scenario_keys" not in sent["context"]
 
 
 async def test_unknown_scenario_key_falls_back_to_unscoped(monkeypatch):
@@ -99,9 +124,9 @@ async def test_unknown_scenario_key_falls_back_to_unscoped(monkeypatch):
     p = Pipeline("p1", "카운터 앱 만들어줘")
     p.mark_completed("implement", {"branch": "some-branch"})
 
-    await main._retry_implement_with_feedback(p, "문제 있음", "ATM-999")
+    await main._retry_implement_with_feedback(p, "문제 있음", ["ATM-999"])
 
     instruction = sent["instruction"]
     assert "카운터 앱 만들어줘" in instruction
     assert "범위 제한" not in instruction
-    assert "scenario_key" not in sent["context"]
+    assert "scenario_keys" not in sent["context"]

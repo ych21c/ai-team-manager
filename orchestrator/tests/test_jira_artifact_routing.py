@@ -19,7 +19,12 @@ from main import _implement_jira_comment_targets, _scenarios_with_jira_issue
 # ── _implement_jira_comment_targets ─────────────────────────────────────────
 
 def test_scoped_retry_targets_only_that_issue():
-    assert _implement_jira_comment_targets("ATM-5", ["ATM-3", "ATM-5", "ATM-9"]) == ["ATM-5"]
+    assert _implement_jira_comment_targets(["ATM-5"], ["ATM-3", "ATM-5", "ATM-9"]) == ["ATM-5"]
+
+
+def test_scoped_retry_with_multiple_keys_targets_only_those_issues():
+    """멀티선택 — 여러 키로 범위를 좁히면 그 이슈들에만 코멘트를 남겨야 한다."""
+    assert _implement_jira_comment_targets(["ATM-5", "ATM-9"], ["ATM-3", "ATM-5", "ATM-9"]) == ["ATM-5", "ATM-9"]
 
 
 def test_unscoped_targets_all_stories():
@@ -32,11 +37,11 @@ def test_unknown_scenario_key_falls_back_to_all_stories():
     """PM이 잘못 판단했거나 project_jira 상태와 어긋난 키는 실제 이슈가
     아니므로, 조용히 전체 스토리로 폴백해야 한다(엉뚱한 이슈에 코멘트가
     달리는 것보다 안전)."""
-    assert _implement_jira_comment_targets("ATM-999", ["ATM-3", "ATM-5"]) == ["ATM-3", "ATM-5"]
+    assert _implement_jira_comment_targets(["ATM-999"], ["ATM-3", "ATM-5"]) == ["ATM-3", "ATM-5"]
 
 
 def test_no_stories_returns_empty():
-    assert _implement_jira_comment_targets("ATM-5", []) == []
+    assert _implement_jira_comment_targets(["ATM-5"], []) == []
     assert _implement_jira_comment_targets(None, []) == []
 
 
