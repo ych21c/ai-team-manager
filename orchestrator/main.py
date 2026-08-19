@@ -57,10 +57,15 @@ project_jira:   dict[str, dict]    = {}   # project_id → { epic, stories, conf
 project_docs:   dict[str, dict]    = {}   # project_id → { overview, architecture, history:[...], confluence_page_id }
 project_messages: dict[str, list[dict]] = {}   # project_id → 채팅 메시지 이력 (새로고침 시 복원용)
 MAX_STORED_MESSAGES = 300   # 프로젝트당 메모리 상한
-# project_id → {"input_tokens": int, "output_tokens": int, "cost_usd": float} — 프로젝트
-# 전체 누적. outputs["input_tokens"/"output_tokens"/"cost_usd"]는 "이번 실행 1회분"이라
-# Run으로 재실행하면 merge 시 덮어써진다(pipeline.py mark_completed) — 게이트 노드
-# 배지는 "이번 실행", 탭 헤더 합계는 이 누적치를 쓴다.
+# project_id → {"by_sprint": {"1": {"planning": {input_tokens,output_tokens,cost_usd}, "design": {...}, ...}, "2": {...}},
+#               "pre_migration": {input_tokens,output_tokens,cost_usd} | None}
+# 스프린트(전체 재기획 회차) × 스테이지 단위로 누적한다 — outputs["input_tokens"/
+# "output_tokens"/"cost_usd"]는 "이번 실행 1회분"이라 Run으로 재실행하면 merge 시
+# 덮어써진다(pipeline.py mark_completed)지만, 여기 누적치는 사라지지 않는다.
+# 게이트 노드 배지는 "이번 실행", 탭 헤더는 이 누적치의 파생 합계(_derive_lifetime_totals)를
+# 쓴다. "pre_migration"은 이 스프린트/스테이지 분리 기능 도입 전 이미 쌓여있던
+# 평면 누적치를 옮겨 담는 자리 — 진짜 "1번 스프린트 비용"이 아니라서 가짜
+# 스프린트 밑에 끼워넣지 않고 형제 필드로 분리한다(_load_all_projects 참고).
 project_token_totals: dict[str, dict] = {}
 # project_id → { app_name, app_identifier, language, app_version, environment,
 # platforms: ["ios","android"], host_workspace_path } — 스프린트 화면 배포 카드에서
@@ -175,6 +180,10 @@ def _save_project(pid: str):
         **_make_project_info(pid),  # instruction도 이제 여기 포함됨
         "jira": project_jira.get(pid, {}),
         "doc":  project_docs.get(pid, {}),
+        # _make_project_info()의 "token_totals"는 API/WS용 파생 뷰({lifetime, by_sprint})라
+        # 그대로 저장하면 재시작 후 _load_all_projects가 그걸 원본으로 착각해
+        # 이중 파생/오염된다 — 여기서 내부 저장 모양({by_sprint, pre_migration})으로 덮어쓴다.
+        "token_totals": project_token_totals.get(pid, {"by_sprint": {}, "pre_migration": None}),
     }
     with open(f"{STATE_DIR}/{pid}.json", "w") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -223,7 +232,7 @@ def _load_all_projects():
         if data.get("doc"):
             project_docs[pid] = data["doc"]
         if data.get("token_totals"):
-            project_token_totals[pid] = data["token_totals"]
+            project_token_totals[pid] = _migrate_token_totals(data["token_totals"])
         if data.get("deploy_config"):
             project_deploy_config[pid] = data["deploy_config"]
         if data.get("deploy_status"):
@@ -276,19 +285,52 @@ async def event_loop():
             await asyncio.sleep(1)
 
 
-def _accumulate_token_usage(project_id: str, outputs: dict):
-    """이번 실행분 토큰/비용을 프로젝트 누적치에 더한다. outputs에 토큰 필드가
-    없는 스테이지(autotest — LLM 호출 없음, PR 생성 실패 등 조기 종료 경로)는
-    조용히 건너뛴다. Run으로 같은 스테이지를 여러 번 재실행해도(outputs는 매번
-    덮어써짐) 누적치는 사라지지 않도록 여기서만 더한다."""
+def _accumulate_token_usage(project_id: str, sprint: int, stage_name: str, outputs: dict):
+    """이번 실행분 토큰/비용을 프로젝트의 {스프린트: {스테이지: 누적치}}에 더한다.
+    outputs에 토큰 필드가 없는 스테이지(autotest — LLM 호출 없음, PR 생성 실패 등
+    조기 종료 경로)는 조용히 건너뛴다. Run으로 같은 스테이지를 여러 번 재실행해도
+    (outputs는 매번 덮어써짐) 누적치는 사라지지 않도록 여기서만 더한다. design처럼
+    에이전트 둘(designer+architect)이 같은 stage_name으로 각자 완료 보고하는
+    경우도 자연스럽게 한 버킷에 합산된다."""
     in_tok  = outputs.get("input_tokens")
     out_tok = outputs.get("output_tokens")
     if not in_tok and not out_tok:
         return
-    totals = project_token_totals.setdefault(project_id, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0})
+    by_sprint = project_token_totals.setdefault(project_id, {"by_sprint": {}, "pre_migration": None})["by_sprint"]
+    totals = by_sprint.setdefault(str(sprint), {}).setdefault(
+        stage_name, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    )
     totals["input_tokens"]  += in_tok or 0
     totals["output_tokens"] += out_tok or 0
     totals["cost_usd"]      += outputs.get("cost_usd") or 0.0
+
+
+def _derive_lifetime_totals(pid: str) -> dict:
+    """pre_migration(있으면) + 모든 스프린트/스테이지 누적치를 합산한 평생 총합.
+    저장은 스프린트×스테이지 단위로 하고, 이 합계는 API/WS로 나갈 때만 파생한다
+    (두 군데에 따로 저장하면 서로 어긋날 수 있어서 단일 소스로 유지)."""
+    data = project_token_totals.get(pid, {})
+    total = dict(data.get("pre_migration") or {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0})
+    total.setdefault("input_tokens", 0)
+    total.setdefault("output_tokens", 0)
+    total.setdefault("cost_usd", 0.0)
+    for stages in (data.get("by_sprint") or {}).values():
+        for stage_totals in stages.values():
+            total["input_tokens"]  += stage_totals.get("input_tokens", 0)
+            total["output_tokens"] += stage_totals.get("output_tokens", 0)
+            total["cost_usd"]      += stage_totals.get("cost_usd", 0.0)
+    return total
+
+
+def _migrate_token_totals(stored: dict) -> dict:
+    """저장된 token_totals가 이 기능(스프린트×스테이지 분리) 도입 전의 옛
+    평면 모양({input_tokens, output_tokens, cost_usd})이면 새 모양으로 감싼다.
+    옛 모양은 최상위에 "input_tokens" 키가 직접 있는 걸로 판별한다 — 새 모양은
+    항상 "by_sprint"/"pre_migration"만 최상위에 있으므로 이 판별은 멱등이다
+    (이미 새 모양이면 그대로 통과)."""
+    if "input_tokens" in stored:
+        return {"by_sprint": {}, "pre_migration": stored}
+    return stored
 
 
 async def handle_agent_event(event: dict):
@@ -317,7 +359,7 @@ async def handle_agent_event(event: dict):
             await _handle_chat_triage_result(pipeline, project_id, outputs)
             return
 
-        _accumulate_token_usage(project_id, outputs)
+        _accumulate_token_usage(project_id, pipeline.sprint, stage_name, outputs)
 
         # QA든 AutoTest(CI)든, 실패했는데 구체적인 피드백(needs_rework)이 있으면
         # 사람이 볼 것도 없이 Implement에 바로 재작업을 요청한다 — 예전엔 AutoTest는
@@ -1289,7 +1331,10 @@ def _make_project_info(pid: str) -> dict:
         "repo":     project_repos.get(pid, ""),
         "messages": project_messages.get(pid, []),
         "jira":     project_jira.get(pid, {}),
-        "token_totals": project_token_totals.get(pid, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}),
+        "token_totals": {
+            "lifetime": _derive_lifetime_totals(pid),
+            "by_sprint": project_token_totals.get(pid, {}).get("by_sprint", {}),
+        },
         "deploy_config": project_deploy_config.get(pid, {}),
         "deploy_status": project_deploy_status.get(pid, {"status": "idle"}),
     }

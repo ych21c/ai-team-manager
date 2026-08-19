@@ -25,7 +25,11 @@ interface Message {
 interface JiraInfo {
   epic?: string; stories?: string[]; confluence_url?: string; jira_url?: string;
 }
-interface TokenTotals { input_tokens: number; output_tokens: number; cost_usd: number; }
+interface StageTokenTotal { input_tokens: number; output_tokens: number; cost_usd: number; }
+interface TokenTotals {
+  lifetime: StageTokenTotal;
+  by_sprint: Record<string, Record<string, StageTokenTotal>>;
+}
 interface DeployConfig {
   app_name?: string; app_identifier?: string; language?: string; app_version?: string;
   environment?: "test" | "dev" | "prod"; platforms?: string[]; host_workspace_path?: string;
@@ -861,10 +865,11 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
     post(`/projects/${projectId}/approve/${stage}`, extraInput ? { extra_input: extraInput } : {}));
 
   const totals = project?.token_totals;
+  const currentSprintTotals = totals?.by_sprint?.[String(project?.sprint ?? 1)];
 
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: "16px 20px", display: "flex", flexDirection: "column", gap: 4 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: currentSprintTotals ? 4 : 8 }}>
         <div style={{ fontSize: 11, color: "#aaa", display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{
             fontSize: 10.5, fontWeight: 500, color: "#7F77DD", background: "#EEEDFE",
@@ -874,11 +879,27 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
           </span>
           <span>PM → Design → Implement → QA → AutoTest → Release</span>
         </div>
-        <div style={{ fontSize: 11, color: "#aaa" }}>
-          누적: 🔤 {totals?.input_tokens ?? 0} in · {totals?.output_tokens ?? 0} out
-          {totals?.cost_usd ? ` · $${totals.cost_usd.toFixed(4)}` : ""}
+        <div style={{ fontSize: 11, color: "#aaa" }} title="pre_migration(스프린트별 누적 도입 전 누적치) 포함 전체 합계">
+          전체 누적: 🔤 {totals?.lifetime.input_tokens ?? 0} in · {totals?.lifetime.output_tokens ?? 0} out
+          {totals?.lifetime.cost_usd ? ` · $${totals.lifetime.cost_usd.toFixed(4)}` : ""}
         </div>
       </div>
+
+      {currentSprintTotals && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+          {PIPELINE_ORDER.filter(name => currentSprintTotals[name]).map(name => {
+            const t = currentSprintTotals[name];
+            return (
+              <span key={name} style={{
+                fontSize: 10, color: "#888", background: "#f7f7f7",
+                border: "0.5px solid #eee", borderRadius: 5, padding: "1px 6px",
+              }} title={`Sprint ${project?.sprint ?? 1} · ${STAGE_META[name].label} 누적`}>
+                {STAGE_META[name].label}: {tokenBadgeText(t)}
+              </span>
+            );
+          })}
+        </div>
+      )}
 
       {notice && (
         <div style={{ fontSize: 12, color: "#A32D2D", background: "#FCEBEB", border: "0.5px solid #F0C6C6", borderRadius: 6, padding: "6px 10px", marginBottom: 4 }}>
