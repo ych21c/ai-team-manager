@@ -1157,6 +1157,31 @@ def _reset_stage_cascade(pipeline: Pipeline, stage_name: str):
         stage.approved = False
 
 
+def _cancel_running_stage(pipeline: Pipeline, stage_name: str):
+    """"취소" 버튼 — 아직 실행 중(running)인 스테이지를 되돌린다. _reset_stage_cascade와
+    달리 대상 스테이지 자체의 outputs/agents_done/approved는 보존한다 — design처럼
+    에이전트가 여럿(designer+architect)인 스테이지에서 한쪽만 안 끝났는데 취소하면,
+    이미 끝낸 쪽의 산출물까지 날리고 처음부터 다시 돌게 만들던 문제가 있었다
+    (recoveryfit에서 실제 재현: architect는 이미 끝났는데 취소→재승인하면 architect
+    까지 처음부터 다시 돎). keep_agents_done을 세워두면 advance_pipeline이 다음번
+    이 스테이지를 돌릴 때 agents_done에 이미 있는 에이전트는 건너뛰고 나머지만
+    태스크를 보낸다. approved는 건드리지 않아도 된다 — gateIsPending(프론트)이
+    보는 건 status뿐이라 PENDING이면 어차피 게이트가 다시 뜨고, "Yes"를 누르면
+    advance_pipeline이 (approve() 자체는 상태가 WAITING이 아니라 no-op이어도)
+    무조건 실행돼 이어서 진행된다. 다운스트림 스테이지는 어차피 아직 시작 전이라
+    (design도 안 끝났으므로) _reset_stage_cascade와 동일하게 완전히 초기화한다."""
+    order = ["planning", "design", "implement", "qa", "autotest", "release"]
+    idx = order.index(stage_name)
+    stage = pipeline.stages[stage_name]
+    stage.status = StageStatus.PENDING
+    stage.keep_agents_done = True
+    for name in order[idx + 1:]:
+        downstream = pipeline.stages[name]
+        downstream.status = StageStatus.PENDING
+        downstream.outputs = {}
+        downstream.approved = False
+
+
 async def advance_pipeline(pipeline: Pipeline):
     # 프로젝트 전용 팀(pm/designer/architect/release) 컨테이너가 없으면(수동으로
     # 지웠다가 재기동을 깜빡한 경우 등) 여기서 항상 먼저 보장한다 — 실제로 오늘
@@ -1231,6 +1256,14 @@ async def advance_pipeline(pipeline: Pipeline):
         await _jira_stage_started(pipeline.project_id, stage.name)
 
         for agent_name in stage.agents:
+            # mark_running이 keep_agents_done으로 agents_done을 보존해준 경우(취소 후
+            # 재승인) 이미 끝낸 에이전트는 건너뛴다 — 안 그러면 design처럼 에이전트가
+            # 여럿인 스테이지에서 한쪽만 취소했는데 이미 끝난 다른 쪽까지 다시 돈다
+            # (recoveryfit에서 실제 재현: architect는 이미 끝났는데 취소하니 처음부터
+            # 다시 돎). 평소(agents_done이 매번 비워지는 정상 재실행)엔 항상 빈
+            # 리스트라 이 조건이 아무것도 걸러내지 않는다.
+            if agent_name in stage.agents_done:
+                continue
             # implement/autotest는 전역 공유 싱글턴(docker-compose 정적 서비스) — 큐도 전역.
             # 나머지(pm/designer/architect/qa/release)는 TeamSpawner가 프로젝트별로 격리해서
             # 띄우므로 큐도 프로젝트별로 분리해야 서로 태스크를 중복으로 가져가지 않는다.
@@ -1861,8 +1894,14 @@ async def discard_stage(project_id: str, stage_name: str):
     p = projects.get(project_id)
     if not p:
         raise HTTPException(404)
-    _reset_stage_cascade(p, stage_name)
-    await _add_history(project_id, f"✗ '{stage_name}' 폐기 — 이전 단계로 되돌림")
+    if p.stages[stage_name].status == StageStatus.RUNNING:
+        # "취소" — 아직 안 끝난 스테이지를 되돌리는 경우, 이미 끝낸 에이전트(design의
+        # designer/architect처럼)의 산출물은 보존한다.
+        _cancel_running_stage(p, stage_name)
+        await _add_history(project_id, f"⏹ '{stage_name}' 취소 — 이전 단계로 되돌림")
+    else:
+        _reset_stage_cascade(p, stage_name)
+        await _add_history(project_id, f"✗ '{stage_name}' 폐기 — 이전 단계로 되돌림")
     await broadcast({
         "type": "project_updated", "project_id": project_id,
         "projects": {project_id: _make_project_info(project_id)},

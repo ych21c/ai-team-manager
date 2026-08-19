@@ -672,7 +672,7 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
   };
 
   const handleCancel = () => {
-    if (!window.confirm(`'${meta.label}' 실행 중인 작업을 취소하고 이전 단계로 되돌릴까요? 에이전트 컨테이너 자체는 안 죽이므로, 살아있던 원래 작업이 나중에 뒤늦게 응답하면 그 사이 다시 실행한 결과를 덮어쓸 수 있습니다 — 토큰 소진 등으로 죽어서 멈춘 것 같을 때만 쓰세요.`)) return;
+    if (!window.confirm(`'${meta.label}' 실행 중인 작업을 취소하고 이전 단계로 되돌릴까요? 이미 끝낸 에이전트의 결과물은 보존되고, 아직 안 끝난 에이전트만 다음 승인 때 다시 실행됩니다. (단, 에이전트 컨테이너 자체는 안 죽이므로 원래 작업이 살아있다가 나중에 뒤늦게 응답하면 다시 실행한 결과를 덮어쓸 수 있습니다 — 토큰 소진 등으로 죽어서 멈춘 것 같을 때만 쓰세요.)`)) return;
     onDiscard(name);
   };
 
