@@ -5,8 +5,30 @@
 // planning은 되돌아갈 "이전 단계"가 없어서 제외.
 const DISCARDABLE_STAGES = new Set(["design", "implement", "qa", "autotest", "release"]);
 
+// "failed"도 폐기 가능 대상에 포함한다 — orchestrator/main.py의 stage_failed
+// 이벤트 처리가 생기면서(에이전트가 예외로 죽으면 명시적으로 실패 보고) 이제
+// design/pm/architect/release 같은 스테이지도 실제로 "failed" 상태에 도달할 수
+// 있는데, 여기서 빠지면 실패한 스테이지에 재실행/폐기 버튼이 하나도 안 뜨는
+// 막다른 골목이 된다.
 function canDiscardStage(stageName, status) {
-  return DISCARDABLE_STAGES.has(stageName) && status === "completed";
+  return DISCARDABLE_STAGES.has(stageName) && (status === "completed" || status === "failed");
+}
+
+// "취소" — 아직 안 끝난(running) 스테이지를 강제로 이전 단계로 되돌릴 수 있는지.
+// 백엔드 discard_stage(orchestrator/main.py)는 스테이지 status를 검사하지 않고
+// _DISCARDABLE_STAGES에만 있으면 그대로 실행하므로(토큰 소진 등으로 에이전트가
+// 죽어서 running에 영영 멈춰있는 경우 대비), 프론트도 같은 스테이지 목록에 대해
+// running일 때만 취소 버튼을 노출한다. planning은 discard 자체가 안 되는 첫
+// 스테이지라 여기서도 제외 — 멈추면 채팅으로 재요청해서 재기획(retry-planning)
+// 경로를 써야 한다.
+//
+// 주의: 취소해도 에이전트 컨테이너 자체를 죽이지는 않는다(CLAUDE.md — running
+// 중 컨테이너 재생성은 진행 중이던 redis 태스크를 xack 전에 유실시킨다). 만약
+// 원래 에이전트가 살아있어서 나중에 완료 이벤트를 보내면, 그 사이 같은 스테이지가
+// 다시 실행돼 있을 경우 stale한 결과로 덮어써질 수 있다 — 그 정도 레이스는 감수하고
+// "죽은 것 같은 작업을 손으로 풀어주는" 용도로만 쓴다.
+function canCancelStage(stageName, status) {
+  return DISCARDABLE_STAGES.has(stageName) && status === "running";
 }
 
 // design처럼 에이전트 여럿(designer+architect)이 한 스테이지를 나눠 맡을 때,
@@ -24,4 +46,4 @@ function agentSubStatus(stageStatus, agentName, agentsDone) {
   return stageStatus === "running" ? "running" : "pending";
 }
 
-module.exports = { DISCARDABLE_STAGES, canDiscardStage, agentSubStatus };
+module.exports = { DISCARDABLE_STAGES, canDiscardStage, canCancelStage, agentSubStatus };

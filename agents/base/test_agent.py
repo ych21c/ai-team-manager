@@ -17,6 +17,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "")
 
 from agent import (
     ROLE_PROMPTS,
+    build_stage_failed_event,
     build_summary,
     extract_design_map,
     parse_scenario_mockups,
@@ -269,3 +270,36 @@ def test_single_agent_roles_keep_plain_summary_key_only():
     없으니 예전처럼 "summary" 하나만 쓰면 된다."""
     fields = role_summary_fields("pm", "PRD 요약")
     assert fields == {"summary": "PRD 요약"}
+
+
+# ── build_stage_failed_event ──────────────────────────────────────────
+# process_task가 예외를 던졌을 때(크레딧 소진, 네트워크 에러 등) orchestrator에
+# 보고할 이벤트를 만드는 순수 함수. 예전엔 이 예외가 에이전트 로컬 stderr에만
+# 찍히고 orchestrator는 전혀 몰라서, recoveryfit에서 design 스테이지가 20시간
+# 넘게 "running"으로 멈춰있던 사고가 있었다(사람이 컨테이너 로그를 직접 뒤져야만
+# 알 수 있었음) — 그 사고의 재발을 막는 게 이 함수의 목적이라 필드 하나하나가
+# orchestrator/main.py의 stage_failed 핸들러가 기대하는 것과 정확히 맞아야 한다.
+
+def test_build_stage_failed_event_shape():
+    task = {"project_id": "c052dd6b", "stage": "design", "instruction": "x"}
+    event = build_stage_failed_event(task, "designer", RuntimeError("boom"))
+    assert event == {
+        "type": "stage_failed",
+        "project_id": "c052dd6b",
+        "agent": "designer",
+        "stage": "design",
+        "error": "boom",
+    }
+
+
+def test_build_stage_failed_event_missing_project_id_defaults_to_empty_string():
+    event = build_stage_failed_event({"stage": "design"}, "designer", ValueError("x"))
+    assert event["project_id"] == ""
+
+
+def test_build_stage_failed_event_stringifies_error():
+    """error 필드가 str이어야 한다 — Exception 객체를 그대로 실으면 JSON
+    직렬화(emit이 json.dumps로 redis에 쏨)가 실패한다."""
+    event = build_stage_failed_event({"stage": "design"}, "architect", ConnectionError("네트워크 끊김"))
+    assert event["error"] == "네트워크 끊김"
+    assert isinstance(event["error"], str)
