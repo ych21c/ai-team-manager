@@ -49,6 +49,7 @@ interface Project {
   sprint?: number;
   deploy_config?: DeployConfig;
   deploy_status?: DeployStatus;
+  manual_implement?: boolean;
 }
 interface ApprovalRequest {
   project_id: string; stage: string; message: string;
@@ -696,7 +697,8 @@ function DecisionBlock({ editTarget, gateTarget, stages, jira, draft, setDraft, 
 }
 
 function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpand, onOpenDesign, jira,
-                    editing, onStartEdit, onCancelEdit, draft, setDraft, busy, onRun, onDiscard }: {
+                    editing, onStartEdit, onCancelEdit, draft, setDraft, busy, onRun, onDiscard,
+                    manualImplement, onSetManualImplement }: {
   name: StageName; stageInfo?: StageInfo; projectId: string; isActive: boolean;
   expanded: boolean; onToggleExpand: () => void; onOpenDesign: () => void; jira?: JiraInfo;
   editing: Record<string, boolean>; onStartEdit: (stage: string) => void; onCancelEdit: (stage: string) => void;
@@ -704,6 +706,7 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
   setDraft: (fn: (d: Record<string, string>) => Record<string, string>) => void;
   busy: Record<string, boolean>; onRun: (stage: string, feedback: string, scenarioKeys?: string[]) => void;
   onDiscard: (stage: string) => void;
+  manualImplement?: boolean; onSetManualImplement?: (enabled: boolean) => void;
 }) {
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const scopable = name === "design" || name === "implement";
@@ -763,6 +766,18 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
               게이트 통과 후 자동 시작 — 입력은 이전 스테이지 산출물
             </div>
           )}
+          {name === "implement" && onSetManualImplement && (
+            <label style={{
+              display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#666",
+              background: manualImplement ? "#F5F0FA" : "#fff",
+              border: `0.5px solid ${manualImplement ? "#D9C7EC" : "#e5e5e5"}`,
+              borderRadius: 6, padding: "6px 8px", width: "fit-content", cursor: "pointer",
+            }} title="켜면 컨테이너 에이전트(API 과금) 대신 외부 세션이 이 코드를 직접 작성합니다 — QA 검증은 항상 그대로 자동으로 돕니다.">
+              <input type="checkbox" checked={!!manualImplement}
+                onChange={e => onSetManualImplement(e.target.checked)} />
+              🖐 수동 처리(외부 세션이 코드 작성)
+            </label>
+          )}
           {meta.agents.length > 1 ? (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {meta.agents.map(a => {
@@ -806,6 +821,13 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
                 ? <a href={outputs.pr_url} target="_blank" rel="noreferrer" style={{ color: "#7F77DD" }}>{outputs.pr_url}</a>
                 : <span style={{ fontFamily: "monospace", color: "#666" }}>{outputs?.branch}</span>}
             </div>
+          )}
+          {name === "qa" && status !== "running" && (
+            <button onClick={() => onRun("qa", "")} disabled={busy[name]}
+              style={{ ...flowBtnStyle, alignSelf: "flex-start", background: "#EAF3DE", borderColor: "#C0DD97", color: "#3B6D11" }}
+              title="implement 상태와 무관하게 지금 워크스페이스 코드로 QA(컨테이너 에이전트) 검증만 바로 다시 돌립니다.">
+              {busy[name] ? "실행 중..." : "🧪 밸리데이션만 실행"}
+            </button>
           )}
           {name === "design" && (
             <button onClick={onOpenDesign} style={{ ...flowBtnStyle, alignSelf: "flex-start", background: "#fff" }}>🎨 디자인 보기</button>
@@ -916,6 +938,8 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
   const discardStage = (stage: string) => withBusy(stage, () => post(`/projects/${projectId}/stage/${stage}/discard`));
   const approveStage = (stage: string, extraInput?: string) => withBusy(stage, () =>
     post(`/projects/${projectId}/approve/${stage}`, extraInput ? { extra_input: extraInput } : {}));
+  const setManualImplement = (enabled: boolean) => withBusy("manual_implement", () =>
+    post(`/projects/${projectId}/manual-implement`, { enabled }));
 
   const totals = project?.token_totals;
   const currentSprintTotals = totals?.by_sprint?.[String(project?.sprint ?? 1)];
@@ -975,6 +999,7 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
               onCancelEdit={n => setEditing(v => ({ ...v, [n]: false }))}
               draft={draft} setDraft={setDraft} busy={busy}
               onRun={runStage} onDiscard={discardStage}
+              manualImplement={project?.manual_implement} onSetManualImplement={setManualImplement}
             />
             {next && (
               showGate ? (
