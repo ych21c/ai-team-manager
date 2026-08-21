@@ -773,7 +773,16 @@ async def _route_needs_rework_or_fail(pipeline: Pipeline, project_id: str, stage
     """QA/AutoTest 실패를 Implement 재작업으로 돌릴지, 예산을 다 써서 멈추고
     사람을 부를지 결정한다. 두 스테이지가 같은 카운터(qa_retry_counts)를
     공유해서, 어느 쪽에서 실패가 반복되든 총 MAX_QA_RETRIES회로 묶인다 —
-    "QA 3번 + AutoTest 3번"처럼 재시도가 배로 불어나는 걸 막는다."""
+    "QA 3번 + AutoTest 3번"처럼 재시도가 배로 불어나는 걸 막는다.
+
+    예산이 소진됐을 때, 이 프로젝트가 manual_implement(외부 세션 코딩 우회)를
+    켜둔 상태라면 그냥 멈추고 사람이 API를 수동 호출하길 기다리지 않는다 —
+    manual_implement가 켜져 있다는 건 이미 "이 프로젝트의 implement는 컨테이너
+    대신 외부 세션이 처리한다"는 명시적 선택이므로, 예산 소진도 같은 경로로
+    묶어서 MANUAL_TASKS_DIR에 태스크 파일만 쓰고(_retry_implement_with_feedback→
+    _send_task_or_manual) 카운터를 리셋해 계속 진행한다. manual_implement가
+    꺼진 프로젝트만 기존처럼 FAILED로 멈추고 사람의 수동 개입(retry-implement
+    API)을 기다린다."""
     label = STAGE_LABELS_KO.get(stage_name, stage_name)
     count = qa_retry_counts.get(project_id, 0)
     feedback = outputs.get("feedback", outputs.get("summary", ""))
@@ -787,6 +796,16 @@ async def _route_needs_rework_or_fail(pipeline: Pipeline, project_id: str, stage
         for story in project_jira.get(project_id, {}).get("stories", []):
             await add_jira_comment(story, f"🔁 {label} 재작업 요청 ({count + 1}/{MAX_QA_RETRIES}): {feedback}")
         await _add_history(project_id, f"🔁 {label} 재작업 요청 ({count + 1}/{MAX_QA_RETRIES}): {feedback}")
+        await _retry_implement_with_feedback(pipeline, feedback)
+    elif project_manual_implement.get(project_id, False):
+        qa_retry_counts[project_id] = 0
+        await broadcast({
+            "type": "agent_message", "project_id": project_id, "agent": "system",
+            "content": f"🖐 {label} 재작업을 {MAX_QA_RETRIES}회 시도했지만 여전히 실패 — 외부 세션(manual-agent-work) 작업 요청으로 전환합니다.\n{feedback}",
+        })
+        for story in project_jira.get(project_id, {}).get("stories", []):
+            await add_jira_comment(story, f"🖐 {label} 재작업 {MAX_QA_RETRIES}회 실패 — 외부 세션 작업 요청으로 전환: {feedback}")
+        await _add_history(project_id, f"🖐 {label} 재작업 {MAX_QA_RETRIES}회 실패 — 외부 세션 작업 요청으로 전환: {feedback}")
         await _retry_implement_with_feedback(pipeline, feedback)
     else:
         pipeline.mark_failed(stage_name, outputs)
@@ -1087,7 +1106,19 @@ _NO_BLIND_REVERT_GUIDANCE = (
     "디자인/동작을 바꾼 거라면(예: 배경색·버튼 종류·레이아웃 변경 커밋이 최근에 있음) "
     "실패 원인은 그 변경을 못 따라간 오래된 테스트 쪽일 가능성이 높습니다 — 그럴 땐 앱 "
     "코드가 아니라 테스트를 최신 동작에 맞게 갱신하세요. 반대로 그런 의도적 변경 이력이 "
-    "없다면 앱 코드 쪽 버그일 가능성이 높습니다."
+    "없다면 앱 코드 쪽 버그일 가능성이 높습니다.\n\n"
+    "그리고 이것도 중요합니다 — QA는 매 라운드 integration_test/scenario_test.dart를 "
+    "LLM으로 처음부터 새로 생성합니다. 그러니 실패 원인이 '최근 의도적 설계 변경을 "
+    "테스트가 못 따라감'도 아니고 '앱이 요구사항을 실제로 안 지킴'도 아니라, 테스트 코드 "
+    "자체의 기술적인 가정 실수인 경우가 있습니다 — 예: 위젯 타입을 잘못 추측(실제론 "
+    "Icon인데 CircleAvatar를 찾는다든지), RichText/Text.rich 안의 TextSpan 조각을 "
+    "find.text()로 정확히 매칭하려 함(RichText는 findRichText: true 없이는 아예 안 "
+    "잡힘), 비동기 초기화 타이밍을 감안 안 한 pump 방식 등. 이런 경우 앱 코드(lib/**)는 "
+    "절대 건드리지 마세요 — 그 라운드의 특정 테스트 문구에 맞춰 앱 위젯 구조를 바꿔봐야 "
+    "다음 QA 라운드가 완전히 다른 테스트를 새로 생성하면 그 변경은 무의미해지고, 오히려 "
+    "불필요한 앱 코드 변경만 쌓입니다. 이 경우엔 integration_test/scenario_test.dart만 "
+    "고치고(다른 시나리오는 건드리지 말 것), `flutter test`/`xvfb-run flutter test`로 "
+    "실제로 통과하는지 반드시 실행해서 확인한 뒤 커밋하세요."
 )
 
 

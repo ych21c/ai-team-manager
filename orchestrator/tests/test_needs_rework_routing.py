@@ -68,6 +68,22 @@ async def test_exceeding_max_retries_marks_failed_instead_of_retrying(_stub_side
     assert p.stages["autotest"].status == StageStatus.FAILED
 
 
+@pytest.mark.asyncio
+async def test_exceeding_max_retries_with_manual_implement_routes_to_external_task(_stub_side_effects, monkeypatch):
+    """recoveryfit에서 실제로 재현: manual_implement가 켜진 프로젝트는 예산이
+    소진돼도 그냥 멈추지 않는다 — 사람이 API를 수동 호출하길 기다리는 대신
+    MANUAL_TASKS_DIR 외부 작업 요청 경로(_retry_implement_with_feedback →
+    _send_task_or_manual)로 계속 진행하고, 카운터를 0으로 리셋해 다음
+    MAX_QA_RETRIES 예산을 새로 준다."""
+    monkeypatch.setattr(main, "project_manual_implement", {"p1": True})
+    p = Pipeline("p1", "test")
+    main.qa_retry_counts["p1"] = main.MAX_QA_RETRIES
+    await main._route_needs_rework_or_fail(p, "p1", "qa", {"feedback": "스플래시→랜딩 전환 실패"})
+    assert _stub_side_effects == ["스플래시→랜딩 전환 실패"]
+    assert main.qa_retry_counts["p1"] == 0
+    assert p.stages["qa"].status != StageStatus.FAILED
+
+
 # ── qa_retry_counts 영속화 — reload/재시작에도 예산 가드가 살아남아야 함 ──
 #
 # recoveryfit(c052dd6b)에서 실제로 재현된 사고: orchestrator/main.py를 바인드
