@@ -10,6 +10,9 @@
   3. manual-result 엔드포인트 — handle_agent_event와 동일한 경로를 타서(성공 시
      mark_completed, 실패+needs_rework 시 _route_needs_rework_or_fail) 기존 완료
      처리 로직을 그대로 재사용하는지.
+  4. _send_task_or_manual이 디스패치 방식(큐/수동 파일)과 무관하게 항상
+     stage.current_task에 에이전트별 태스크 스냅샷을 남기는지 — 플로우차트 탭이
+     원시 로그 대신 구조화된 "지금 이 에이전트가 뭘 하는지"를 보여주는 기반.
 
 실행: cd orchestrator && pytest tests/test_manual_stage_dispatch.py -v
 """
@@ -167,6 +170,57 @@ async def test_manual_toggle_off_uses_queue_as_before(monkeypatch, tmp_path):
 
     assert sent == ["implement"]
     assert list(tmp_path.glob("*.json")) == []
+
+
+# ── current_task 스냅샷 ──────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_current_task_recorded_for_queue_dispatch(monkeypatch):
+    sent = []
+
+    async def _fake_send_task(agent_name, pid, task):
+        sent.append(agent_name)
+
+    monkeypatch.setattr(main.redis, "send_task", _fake_send_task)
+
+    p = Pipeline("p1", "지시사항 원본")
+    await main.advance_pipeline(p)  # planning만 ready → pm 큐로
+
+    task = p.stages["planning"].current_task["pm"]
+    assert task["instruction"] == "지시사항 원본"
+    assert task["manual"] is False
+    assert isinstance(task["dispatched_at"], float)
+
+
+@pytest.mark.asyncio
+async def test_current_task_recorded_for_manual_dispatch(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "project_manual_implement", {"p1": True})
+    monkeypatch.setattr(main, "MANUAL_TASKS_DIR", str(tmp_path))
+
+    p = Pipeline("p1", "PRD 원본")
+    p.mark_completed("planning", {})
+    p.stages["design"].approved = True
+    p.mark_completed("design", {})
+    p.stages["implement"].approved = True
+    await main.advance_pipeline(p)
+
+    task = p.stages["implement"].current_task["implement"]
+    assert task["instruction"] == "PRD 원본"
+    assert task["manual"] is True  # 큐로 안 나가도(파일로 대신 나가도) 스냅샷은 남아야 함
+
+
+@pytest.mark.asyncio
+async def test_current_task_tracked_per_agent_for_multi_agent_stage(monkeypatch):
+    """design(designer+architect)처럼 에이전트가 여럿이면 각자 따로 기록돼야
+    한다 — 하나로 합치면 나중에 dispatch된 쪽이 앞의 것을 덮어써 버린다."""
+    monkeypatch.setattr(main.redis, "send_task", _noop)
+
+    p = Pipeline("p1", "PRD 원본")
+    p.mark_completed("planning", {})
+    p.stages["design"].approved = True
+    await main.advance_pipeline(p)  # design ready → designer+architect 둘 다 dispatch
+
+    assert set(p.stages["design"].current_task.keys()) == {"designer", "architect"}
 
 
 # ── manual-result 엔드포인트 ─────────────────────────────────────────────

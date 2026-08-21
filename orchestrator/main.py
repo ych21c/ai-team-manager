@@ -241,6 +241,7 @@ def _load_all_projects():
             pipeline.stages[stage_name].outputs = stage_data.get("outputs") or {}
             pipeline.stages[stage_name].approved = bool(stage_data.get("approved", False))
             pipeline.stages[stage_name].agents_done = list(stage_data.get("agents_done") or [])
+            pipeline.stages[stage_name].current_task = dict(stage_data.get("current_task") or {})
 
         projects[pid]      = pipeline
         project_names[pid] = data.get("name", pid)
@@ -1034,7 +1035,7 @@ async def _retry_planning_with_feedback(
     await advance_pipeline(pipeline)
 
 
-async def _send_task_or_manual(agent_name: str, stream_project_id: str | None, stage_name: str, task: dict):
+async def _send_task_or_manual(pipeline: Pipeline, agent_name: str, stream_project_id: str | None, stage_name: str, task: dict):
     """redis.send_task의 공용 앞단 — project_manual_implement[pid]가 켜진 프로젝트의
     implement 스테이지는 컨테이너 큐 대신 MANUAL_TASKS_DIR에 태스크 파일만 쓰고
     사람(Claude Code 세션)이 완료 후 POST .../manual-result로 보고하게 한다.
@@ -1042,7 +1043,16 @@ async def _send_task_or_manual(agent_name: str, stream_project_id: str | None, s
     "implement"인지 먼저 확인한다. advance_pipeline의 최초 디스패치뿐 아니라
     _retry_implement_with_feedback(QA 실패 후 재작업 등)도 전부 이 함수를
     거쳐야 한다 — 재시도 라운드가 API 과금이 가장 자주 발생하는 경로라 거기를
-    놓치면 비용 절감 효과가 거의 없다."""
+    놓치면 비용 절감 효과가 거의 없다.
+
+    디스패치 방식과 무관하게(큐로 나가든 수동 파일로 쓰이든) 항상 이 에이전트가
+    "지금 실제로 뭘 지시받았는지"를 stage.current_task에 스냅샷으로 남긴다 —
+    플로우차트 탭이 원시 로그 대신 구조화된 태스크 상세를 보여주는 용도."""
+    pipeline.stages[stage_name].current_task[agent_name] = {
+        "instruction": task.get("instruction", ""),
+        "dispatched_at": time.time(),
+        "manual": stage_name == "implement" and project_manual_implement.get(task["project_id"], False),
+    }
     if stage_name == "implement" and project_manual_implement.get(task["project_id"], False):
         os.makedirs(MANUAL_TASKS_DIR, exist_ok=True)
         task_path = f"{MANUAL_TASKS_DIR}/{task['project_id']}_{stage_name}_{agent_name}_{int(time.time())}.json"
@@ -1124,7 +1134,7 @@ async def _retry_implement_with_feedback(pipeline: Pipeline, feedback: str, scen
 
     pipeline.mark_running("implement")
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "implement", "status": "running"})
-    await _send_task_or_manual("implement", None, "implement", {
+    await _send_task_or_manual(pipeline, "implement", None, "implement", {
         "project_id": pid,
         "stage": "implement",
         "instruction": instruction,
@@ -1205,7 +1215,7 @@ async def _retry_qa_with_feedback(pipeline: Pipeline, feedback: str):
 
     pipeline.mark_running("qa")
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "qa", "status": "running"})
-    await _send_task_or_manual("qa", None, "qa", {
+    await _send_task_or_manual(pipeline, "qa", None, "qa", {
         "project_id": pid, "stage": "qa", "instruction": instruction,
         "context": context, "github_repo": project_repos.get(pid, ""),
     })
@@ -1226,7 +1236,7 @@ async def _retry_autotest_with_feedback(pipeline: Pipeline, feedback: str):
 
     pipeline.mark_running("autotest")
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "autotest", "status": "running"})
-    await _send_task_or_manual("autotest", None, "autotest", {
+    await _send_task_or_manual(pipeline, "autotest", None, "autotest", {
         "project_id": pid, "stage": "autotest", "instruction": instruction,
         "context": context, "github_repo": project_repos.get(pid, ""),
     })
@@ -1248,7 +1258,7 @@ async def _retry_release_with_feedback(pipeline: Pipeline, feedback: str):
 
     pipeline.mark_running("release")
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "release", "status": "running"})
-    await _send_task_or_manual("release", pid, "release", {
+    await _send_task_or_manual(pipeline, "release", pid, "release", {
         "project_id": pid, "stage": "release", "instruction": instruction,
         "context": context, "github_repo": project_repos.get(pid, ""),
     })
@@ -1391,7 +1401,7 @@ async def advance_pipeline(pipeline: Pipeline):
             # 나머지(pm/designer/architect/qa/release)는 TeamSpawner가 프로젝트별로 격리해서
             # 띄우므로 큐도 프로젝트별로 분리해야 서로 태스크를 중복으로 가져가지 않는다.
             stream_project_id = None if agent_name in GLOBAL_SHARED_AGENTS else pipeline.project_id
-            await _send_task_or_manual(agent_name, stream_project_id, stage.name, {
+            await _send_task_or_manual(pipeline, agent_name, stream_project_id, stage.name, {
                 "project_id": pipeline.project_id,
                 "stage": stage.name,
                 "instruction": pipeline.instruction,

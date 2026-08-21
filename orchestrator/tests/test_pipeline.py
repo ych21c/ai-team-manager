@@ -361,3 +361,15 @@ def test_summary_includes_approved_flag_for_persistence():
     data = p.summary()
     assert data["stages"]["implement"]["approved"] is True
     assert data["stages"]["planning"]["approved"] is False
+
+
+def test_summary_includes_current_task_field():
+    """플로우차트 탭이 "지금 이 에이전트가 정확히 뭘 지시받았는지" 구조화된
+    형태로 보여주는 기반 — summary에 current_task가 빠지면 프론트가 못 받는다."""
+    p = new_pipeline()
+    assert p.summary()["stages"]["planning"]["current_task"] == {}
+
+    p.stages["planning"].current_task["pm"] = {"instruction": "로그인 화면 추가", "dispatched_at": 123.0, "manual": False}
+    assert p.summary()["stages"]["planning"]["current_task"] == {
+        "pm": {"instruction": "로그인 화면 추가", "dispatched_at": 123.0, "manual": False},
+    }

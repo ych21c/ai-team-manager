@@ -18,7 +18,11 @@ interface StageOutputs {
   input_tokens?: number; output_tokens?: number; cost_usd?: number;
   needs_rework?: boolean; feedback?: string;
 }
-interface StageInfo { status: string; agents: string[]; outputs?: StageOutputs; approved?: boolean; agents_done?: string[]; }
+interface CurrentTask { instruction: string; dispatched_at: number; manual: boolean; }
+interface StageInfo {
+  status: string; agents: string[]; outputs?: StageOutputs; approved?: boolean; agents_done?: string[];
+  current_task?: Record<string, CurrentTask>;
+}
 interface Message {
   id: string; from: string; content: string; ts: number; video?: string;
 }
@@ -210,6 +214,26 @@ function StatusBadge({ status }: { status: AgentStatus }) {
   };
   const [bg, color] = map[status];
   return <span style={{ background: bg, color, fontSize: 11, padding: "2px 8px", borderRadius: 20, whiteSpace: "nowrap" }}>{label[status]}</span>;
+}
+
+// 로그(원시 텍스트 스트림)와 별개로, 이 에이전트가 마지막/현재 라운드에 실제로
+// 무엇을 지시받았는지(instruction) 구조화해서 보여준다 — 완료/실패 후에도 남아있어
+// "이 결과가 애초에 뭘 요청한 라운드였는지" 확인 가능. 재시작은 새 버튼을 따로
+// 만들지 않고 같은 패널의 기존 취소/재실행 버튼을 그대로 쓴다(바로 옆에 노출).
+function TaskDetail({ task }: { task?: CurrentTask }) {
+  if (!task || !task.instruction) return null;
+  const time = new Date(task.dispatched_at * 1000).toLocaleString("ko-KR", { hour12: false });
+  return (
+    <div style={{ fontSize: 11, color: "#777", background: "#fafafa", border: "0.5px solid #eee", borderRadius: 6, padding: "6px 8px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", color: "#aaa", marginBottom: 3 }}>
+        <span>태스크 · {time}</span>
+        {task.manual && <span style={{ color: "#6B3FA0" }}>🖐 수동 처리</span>}
+      </div>
+      <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 90, overflow: "auto" }}>
+        {task.instruction.slice(0, 1000)}
+      </div>
+    </div>
+  );
 }
 
 // ── 에이전트 실행 로그 뷰어 (DetailPanel + 플로우차트 노드 공용) ──────
@@ -806,14 +830,22 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
                         {String(aSummary).slice(0, 1500)}
                       </div>
                     )}
+                    <div style={{ marginTop: 4 }}>
+                      <TaskDetail task={stageInfo?.current_task?.[a]} />
+                    </div>
                   </div>
                 );
               })}
             </div>
-          ) : outputs?.summary && (
-            <div style={{ fontSize: 12, lineHeight: 1.6, background: "#fff", border: "0.5px solid #e5e5e5", borderRadius: 6, padding: "8px 10px", maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap" }}>
-              {String(outputs.summary).slice(0, 2000)}
-            </div>
+          ) : (
+            <>
+              {outputs?.summary && (
+                <div style={{ fontSize: 12, lineHeight: 1.6, background: "#fff", border: "0.5px solid #e5e5e5", borderRadius: 6, padding: "8px 10px", maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap" }}>
+                  {String(outputs.summary).slice(0, 2000)}
+                </div>
+              )}
+              <TaskDetail task={stageInfo?.current_task?.[meta.agents[0]]} />
+            </>
           )}
           {(outputs?.pr_url || outputs?.branch) && (
             <div style={{ fontSize: 11.5 }}>
