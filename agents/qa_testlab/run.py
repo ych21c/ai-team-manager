@@ -693,6 +693,35 @@ _VERIFY_SCENARIOS_RULES = """당신은 Flutter QA 엔지니어입니다. 이 sys
   있는데 테스트에서 `find.text('첫째줄\\n둘째줄')`처럼 합친 문자열로 찾으면 항상
   `findsNothing`으로 실패합니다(recoveryfit에서 실제 재현) — 그럴 땐 각 줄을 따로
   `find.text('첫째줄')`, `find.text('둘째줄')`로 검증하세요.
+- 반대로 한 `Text`/`Text.rich` 위젯 안에 여러 조각이 합쳐진 문구(예:
+  `Text('의료기기 아님 · 전문의 상담을 대체하지 않습니다')` 하나, 또는 문장
+  중간에 `TextSpan`으로 일부만 강조된 경우)에서 그 일부만 검증하고 싶으면
+  `find.text(...)` 완전 일치 대신 `find.textContaining('일부 문구')`를
+  쓰세요 — `find.text()`는 위젯의 전체 텍스트가 정확히 같아야만 매치되므로
+  부분 문자열로는 항상 `findsNothing`으로 실패합니다(recoveryfit에서 실제
+  재현). 그리고 소스가 `Text.rich(...)`가 아니라 순수 `RichText(text:
+  TextSpan(...))` 위젯을 직접 쓰고 있다면 `find.text()`/`find.textContaining()`
+  기본 설정으론 아예 못 찾습니다 — `findRichText: true`를 반드시 추가하세요
+  (`find.textContaining('일부 문구', findRichText: true)`). 소스에서 그
+  텍스트가 `RichText(` 안에 있는지 `Text(`/`Text.rich(` 안에 있는지 먼저
+  확인하세요.
+- `find.byType(...)`에 쓰는 위젯 타입도 실제 소스 코드 excerpt에 그 타입이
+  실제로 등장하는지 먼저 확인하세요 — `CircleAvatar`/`SingleChildScrollView`/
+  `Icon`처럼 프로젝트 고유 클래스가 아닌 범용 Flutter 위젯이라도, 소스에 안
+  보이면 추측으로 쓰지 마세요(recoveryfit에서 실제 재현: 실제로는
+  `Icon(Icons.circle)`인 로딩 점을 `CircleAvatar`로 짐작해서 실패, 스크롤
+  없는 단일 뷰포트 레이아웃인데 `SingleChildScrollView`가 있다고 짐작해서
+  실패). 레이아웃 비율(예: "히어로 영역이 상단 55%")처럼 위젯 테스트로 픽셀
+  단위 검증이 부적절한 시나리오는 특정 위젯 타입 존재 여부로 억지로 검증하지
+  말고, 그 화면의 핵심 콘텐츠(텍스트/버튼)가 표시되는지로 충분히 검증하세요.
+- 화면 전환 후 `tester.pump(Duration(...))`로 큰 시간을 건너뛰었다면(위
+  `pumpUntilFound` 패턴을 안 쓰는 경우), 그 직후 남은 비동기 초기화가 마저
+  끝나도록 `await tester.pumpAndSettle(const Duration(milliseconds: 500));`을
+  이어서 호출하세요 — 반복 애니메이션이 이미 끝난 화면(목적지 화면)에서는
+  안전합니다. 같은 테스트 파일 안에서 이 마무리 호출을 어떤 시나리오엔
+  붙이고 어떤 시나리오엔 빠뜨리면, 빠뜨린 쪽만 비동기 체인이 안 끝난 채로
+  검증해서 실패합니다(recoveryfit에서 실제 재현) — 화면 전환을 확인하는
+  모든 시나리오에 일관되게 붙이세요.
 - 다른 설명 없이, 파일 전체를 ```dart 코드 블록 하나 안에만 출력하세요."""
 
 
