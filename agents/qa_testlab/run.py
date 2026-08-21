@@ -35,6 +35,13 @@ AGENT_NAME   = "qa"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 QA_MODEL = "claude-haiku-4-5-20251001"
+# Anthropic Models API(GET /v1/models/claude-haiku-4-5-20251001)로 직접 확인한
+# 이 모델의 실제 출력 한도 — max_tokens를 이보다 낮게(예전엔 4096) 잡아두면
+# 시나리오가 누적될수록 생성 응답이 중간에 잘리는 사고로 이어진다(이 세션에서
+# 실제 재현 — "생성된 테스트가 길이 제한에 걸려 잘렸습니다"로 계속 스킵됨).
+# max_tokens 자체는 실제 쓴 토큰만큼만 과금되므로(상한일 뿐, 예약이 아님) 낮춰서
+# 아낄 이유가 없다 — 아래 verify_scenarios가 스트리밍으로 이 값을 그대로 쓴다.
+QA_MODEL_MAX_TOKENS = 64000
 # agents/implement_openhands/run.py의 ARTIFACT_APK_NAME과 반드시 같은 값이어야
 # Implement가 남긴 handoff APK를 QA가 찾을 수 있다.
 IMPLEMENT_ARTIFACT_APK_NAME = "app-debug.apk"
@@ -813,12 +820,19 @@ async def verify_scenarios(project_id: str, workspace: str, context: dict, instr
     # Implement가 고칠 문제라서).
     for attempt in range(MAX_QA_BUILD_FIX_ROUNDS + 1):
         try:
-            resp = client.messages.create(
+            # 논스트리밍 client.messages.create()로 max_tokens=64000을 요청하면
+            # SDK가 "이 길이면 10분 타임아웃을 넘길 수 있다"고 보고 스트리밍을
+            # 요구한다(agents/base/agent.py가 이미 같은 이유로 haiku 역할에
+            # 스트리밍을 쓰는 것과 동일한 제약) — 스트리밍으로 끝까지 받은 뒤
+            # get_final_message()로 기존 코드가 기대하는 것과 같은 모양(resp.usage/
+            # resp.content[0].text/resp.stop_reason)의 객체를 그대로 얻는다.
+            with client.messages.stream(
                 model=QA_MODEL,
-                max_tokens=4096,
+                max_tokens=QA_MODEL_MAX_TOKENS,
                 system=system_blocks,
                 messages=messages,
-            )
+            ) as stream:
+                resp = stream.get_final_message()
             _track_usage(resp)
             code, skip_reason = _extract_scenario_test_code(resp.content[0].text, resp.stop_reason)
             if skip_reason:
