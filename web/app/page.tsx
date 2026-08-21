@@ -54,6 +54,7 @@ interface Project {
   deploy_config?: DeployConfig;
   deploy_status?: DeployStatus;
   manual_implement?: boolean;
+  manual_qa_build?: boolean;
 }
 interface ApprovalRequest {
   project_id: string; stage: string; message: string;
@@ -754,7 +755,7 @@ function DecisionBlock({ editTarget, gateTarget, stages, jira, draft, setDraft, 
 
 function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpand, onOpenDesign, jira,
                     editing, onStartEdit, onCancelEdit, draft, setDraft, busy, onRun, onDiscard,
-                    manualImplement, onSetManualImplement, agentByName }: {
+                    manualImplement, onSetManualImplement, manualQaBuild, onSetManualQaBuild, agentByName }: {
   name: StageName; stageInfo?: StageInfo; projectId: string; isActive: boolean;
   expanded: boolean; onToggleExpand: () => void; onOpenDesign: () => void; jira?: JiraInfo;
   editing: Record<string, boolean>; onStartEdit: (stage: string) => void; onCancelEdit: (stage: string) => void;
@@ -763,6 +764,7 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
   busy: Record<string, boolean>; onRun: (stage: string, feedback: string, scenarioKeys?: string[]) => void;
   onDiscard: (stage: string) => void;
   manualImplement?: boolean; onSetManualImplement?: (enabled: boolean) => void;
+  manualQaBuild?: boolean; onSetManualQaBuild?: (enabled: boolean) => void;
   agentByName: Record<string, AgentState>;
 }) {
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
@@ -833,6 +835,18 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
               <input type="checkbox" checked={!!manualImplement}
                 onChange={e => onSetManualImplement(e.target.checked)} />
               🖐 수동 처리(외부 세션이 코드 작성)
+            </label>
+          )}
+          {name === "qa" && onSetManualQaBuild && (
+            <label style={{
+              display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#666",
+              background: manualQaBuild ? "#F5F0FA" : "#fff",
+              border: `0.5px solid ${manualQaBuild ? "#D9C7EC" : "#e5e5e5"}`,
+              borderRadius: 6, padding: "6px 8px", width: "fit-content", cursor: "pointer",
+            }} title="QA가 스스로 작성한 테스트 코드가 컴파일 자체가 안 될 때(자체 수정도 실패) — 켜면 Implement 대신 외부 세션에게 넘깁니다. 꺼져 있으면 이번 라운드를 그냥 건너뜁니다. 시나리오 검증 자체(통과/실패 판정)는 이 토글과 무관하게 항상 자동입니다.">
+              <input type="checkbox" checked={!!manualQaBuild}
+                onChange={e => onSetManualQaBuild(e.target.checked)} />
+              🖐 테스트 코드 빌드 실패 시 외부 처리
             </label>
           )}
           {meta.agents.length > 1 ? (
@@ -1008,6 +1022,8 @@ function FlowchartTab({ project, projectId, agents, onOpenDesign }: {
     post(`/projects/${projectId}/approve/${stage}`, extraInput ? { extra_input: extraInput } : {}));
   const setManualImplement = (enabled: boolean) => withBusy("manual_implement", () =>
     post(`/projects/${projectId}/manual-implement`, { enabled }));
+  const setManualQaBuild = (enabled: boolean) => withBusy("manual_qa_build", () =>
+    post(`/projects/${projectId}/manual-qa-build`, { enabled }));
 
   const totals = project?.token_totals;
   const currentSprintTotals = totals?.by_sprint?.[String(project?.sprint ?? 1)];
@@ -1068,6 +1084,7 @@ function FlowchartTab({ project, projectId, agents, onOpenDesign }: {
               draft={draft} setDraft={setDraft} busy={busy}
               onRun={runStage} onDiscard={discardStage}
               manualImplement={project?.manual_implement} onSetManualImplement={setManualImplement}
+              manualQaBuild={project?.manual_qa_build} onSetManualQaBuild={setManualQaBuild}
               agentByName={agentByName}
             />
             {next && (
@@ -1608,9 +1625,12 @@ export default function Home() {
     if (type === "init") {
       const raw = event.projects as Record<string, Project & { messages?: Message[] }>;
       if (raw) {
+        // 필드를 하나하나 골라 담다가 새 필드(manual_implement, token_totals 등)를
+        // 추가할 때마다 여기 안 넣으면 서버가 값을 내려줘도 화면엔 영원히 반영이
+        // 안 되는 사고가 반복됐다(manual_implement 체크박스가 그렇게 깨져 있었음)
+        // — v를 통째로 펼치고 필요한 것만 덮어써서 이 클래스의 버그를 원천 차단.
         const list = Object.entries(raw).map(([id, v]) => ({
-          id, name: v.name ?? id, repo: v.repo, stages: v.stages, jira: v.jira, sprint: v.sprint,
-          deploy_config: v.deploy_config, deploy_status: v.deploy_status,
+          ...v, id, name: v.name ?? id,
         }));
         setProjects(list);
         // approval_required는 단발성 이벤트라 그 순간 연결이 안 돼 있었으면
@@ -1628,8 +1648,7 @@ export default function Home() {
       const raw = event.projects as Record<string, Project>;
       if (raw) {
         const updates = Object.entries(raw).map(([id, v]) => ({
-          id, name: v.name ?? id, repo: v.repo, stages: v.stages, jira: v.jira, sprint: v.sprint,
-          deploy_config: v.deploy_config, deploy_status: v.deploy_status,
+          ...v, id, name: v.name ?? id,
         }));
         // project_updated는 바뀐 프로젝트 하나만 실어 보낸다(discard/approve/deploy
         // 등 대부분의 엔드포인트가 그렇게 브로드캐스트함) — 예전엔 여기서 setProjects를

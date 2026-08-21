@@ -62,6 +62,18 @@ GLOBAL_SHARED_AGENTS = {"implement", "autotest", "qa"}
 project_manual_implement: dict[str, bool] = {}
 MANUAL_TASKS_DIR = "/workspace/manual_tasks"
 
+# QA 자신이 생성한 시나리오 테스트 코드가 컴파일 자체가 안 되는 경우(예: Flutter
+# Finder엔 없는 `.or()` 호출) — agents/qa_testlab/run.py가 자체 수정을
+# MAX_QA_BUILD_FIX_ROUNDS번 시도해도 못 고치면, project_manual_qa_build[pid]가
+# True일 때만 Implement가 아니라 사람(Claude Code 세션)에게 직접 넘긴다(QA
+# manual-result로 완료 보고 — implement와 동일한 우회를 stage="qa"에 재사용).
+# False면 QA는 그 라운드를 건너뛸 뿐 Implement에 재작업을 요청하지 않는다(앱
+# 코드는 이미 맞을 수 있는 QA 자신의 문제라서). implement처럼 값 자체는 프로젝트별
+# 런타임 토글이지만, 실제 판단(자체 수정 시도/실패 감지)은 qa 컨테이너 안에서
+# 일어나므로 이 값은 dispatch 시점에 task payload로 실어 보낸다(advance_pipeline/
+# _retry_qa_with_feedback 참고) — orchestrator가 QA 실행 중간에 개입할 수 없어서다.
+project_manual_qa_build: dict[str, bool] = {}
+
 # ── 전역 상태 ────────────────────────────────────────────────────────
 projects:       dict[str, Pipeline] = {}
 project_names:  dict[str, str]     = {}   # project_id → 표시명
@@ -259,6 +271,8 @@ def _load_all_projects():
             qa_retry_counts[pid] = data["qa_retry_count"]
         if data.get("manual_implement"):
             project_manual_implement[pid] = True
+        if data.get("manual_qa_build"):
+            project_manual_qa_build[pid] = True
         if data.get("deploy_config"):
             project_deploy_config[pid] = data["deploy_config"]
         if data.get("deploy_status"):
@@ -1218,6 +1232,7 @@ async def _retry_qa_with_feedback(pipeline: Pipeline, feedback: str):
     await _send_task_or_manual(pipeline, "qa", None, "qa", {
         "project_id": pid, "stage": "qa", "instruction": instruction,
         "context": context, "github_repo": project_repos.get(pid, ""),
+        "manual_qa_build_fix": project_manual_qa_build.get(pid, False),
     })
 
 
@@ -1401,13 +1416,16 @@ async def advance_pipeline(pipeline: Pipeline):
             # 나머지(pm/designer/architect/qa/release)는 TeamSpawner가 프로젝트별로 격리해서
             # 띄우므로 큐도 프로젝트별로 분리해야 서로 태스크를 중복으로 가져가지 않는다.
             stream_project_id = None if agent_name in GLOBAL_SHARED_AGENTS else pipeline.project_id
-            await _send_task_or_manual(pipeline, agent_name, stream_project_id, stage.name, {
+            task_payload = {
                 "project_id": pipeline.project_id,
                 "stage": stage.name,
                 "instruction": pipeline.instruction,
                 "context": context,
                 "github_repo": project_repos.get(pipeline.project_id, ""),
-            })
+            }
+            if stage.name == "qa":
+                task_payload["manual_qa_build_fix"] = project_manual_qa_build.get(pipeline.project_id, False)
+            await _send_task_or_manual(pipeline, agent_name, stream_project_id, stage.name, task_payload)
 
 
 def _make_project_info(pid: str) -> dict:
@@ -1429,6 +1447,7 @@ def _make_project_info(pid: str) -> dict:
         "deploy_config": project_deploy_config.get(pid, {}),
         "deploy_status": project_deploy_status.get(pid, {"status": "idle"}),
         "manual_implement": project_manual_implement.get(pid, False),
+        "manual_qa_build": project_manual_qa_build.get(pid, False),
     }
 
 
@@ -2045,6 +2064,28 @@ async def set_manual_implement(project_id: str, body: ManualImplementToggle):
     await _add_history(project_id, f"🖐 implement 수동 처리 모드 {'켜짐' if body.enabled else '꺼짐'}")
     await broadcast({"type": "project_updated", "project_id": project_id, "projects": {pid: _make_project_info(pid) for pid in projects}})
     return {"ok": True, "manual_implement": body.enabled}
+
+
+class ManualQaBuildToggle(BaseModel):
+    enabled: bool
+
+
+@app.post("/projects/{project_id}/manual-qa-build")
+async def set_manual_qa_build(project_id: str, body: ManualQaBuildToggle):
+    """QA가 자기 시나리오 테스트 코드의 컴파일 실패를 자체 수정 예산 안에 못 고쳤을
+    때, Implement에 넘기지 않고(앱 코드 문제가 아니므로) 사람(Claude Code 세션)에게
+    직접 넘길지 프로젝트별로 토글한다. 꺼져 있으면 QA는 그 라운드를 그냥
+    건너뛴다. manual_implement와 달리 이 값은 orchestrator가 아니라 qa 컨테이너
+    안에서 검사돼야 해서(자체 수정 시도 자체가 그 안에서 일어남) 다음 QA
+    dispatch(advance_pipeline/_retry_qa_with_feedback)의 task payload에 실어
+    보낸다."""
+    if project_id not in projects:
+        raise HTTPException(404)
+    project_manual_qa_build[project_id] = body.enabled
+    _save_project(project_id)
+    await _add_history(project_id, f"🖐 QA 테스트 코드 빌드 실패 외부 처리 {'켜짐' if body.enabled else '꺼짐'}")
+    await broadcast({"type": "project_updated", "project_id": project_id, "projects": {pid: _make_project_info(pid) for pid in projects}})
+    return {"ok": True, "manual_qa_build": body.enabled}
 
 
 class ManualStageResult(BaseModel):
