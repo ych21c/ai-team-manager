@@ -42,6 +42,7 @@ def _stub_side_effects(monkeypatch):
     monkeypatch.setattr(main, "_save_project", lambda pid: None)  # 디스크 I/O는 이 테스트 범위 밖
     monkeypatch.setattr(main.spawner, "spawn_team", lambda *a, **k: None)
     monkeypatch.setattr(main, "project_manual_implement", {})  # 기본은 꺼짐 — 각 테스트가 필요한 만큼만 켬
+    monkeypatch.setattr(main, "project_manual_qa_build", {})  # 기본은 꺼짐 — 각 테스트가 필요한 만큼만 켬
 
 
 def _project_ready_for_qa(pid: str = "p1") -> Pipeline:
@@ -280,3 +281,77 @@ async def test_manual_result_unknown_project_404s():
         assert exc_info.value.status_code == 404
     finally:
         main.projects.update(monkeypatch_projects_backup)
+
+
+# ── project_manual_qa_build — QA 자체 테스트 코드 컴파일 실패 외부 처리 토글 ──
+
+@pytest.mark.asyncio
+async def test_set_manual_qa_build_toggles_and_exposes_in_project_info(monkeypatch):
+    p = Pipeline("p1", "PRD 원본")
+    monkeypatch.setattr(main, "projects", {"p1": p})
+
+    result = await main.set_manual_qa_build("p1", main.ManualQaBuildToggle(enabled=True))
+
+    assert result == {"ok": True, "manual_qa_build": True}
+    assert main.project_manual_qa_build["p1"] is True
+    assert main._make_project_info("p1")["manual_qa_build"] is True
+
+
+@pytest.mark.asyncio
+async def test_set_manual_qa_build_unknown_project_404s():
+    with pytest.raises(main.HTTPException) as exc_info:
+        await main.set_manual_qa_build("nope", main.ManualQaBuildToggle(enabled=True))
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_qa_dispatch_carries_manual_qa_build_flag_to_agent(monkeypatch):
+    """QA는 큐로 나가지만(요구사항: 항상 정상 경로), agents/qa_testlab/run.py가
+    자체 수정 예산 소진 시 외부로 넘길지 판단할 수 있도록 task payload에
+    manual_qa_build_fix를 실어 보내야 한다 — 그 판단은 qa 컨테이너 안에서
+    일어나서 orchestrator가 대신 가로챌 수 없다."""
+    monkeypatch.setattr(main, "project_manual_qa_build", {"p1": True})
+    sent = []
+
+    async def _fake_send_task(agent_name, pid, task):
+        sent.append(task)
+
+    monkeypatch.setattr(main.redis, "send_task", _fake_send_task)
+
+    p = _project_ready_for_qa()
+    await main.advance_pipeline(p)
+
+    assert len(sent) == 1
+    assert sent[0]["manual_qa_build_fix"] is True
+
+
+@pytest.mark.asyncio
+async def test_retry_qa_with_feedback_carries_manual_qa_build_flag(monkeypatch):
+    monkeypatch.setattr(main, "project_manual_qa_build", {"p1": True})
+    sent = []
+
+    async def _fake_send_task(agent_name, pid, task):
+        sent.append(task)
+
+    monkeypatch.setattr(main.redis, "send_task", _fake_send_task)
+
+    p = _project_ready_for_qa()
+    await main._retry_qa_with_feedback(p, "다시 확인해줘")
+
+    assert len(sent) == 1
+    assert sent[0]["manual_qa_build_fix"] is True
+
+
+@pytest.mark.asyncio
+async def test_qa_dispatch_flag_defaults_false_when_toggle_off(monkeypatch):
+    sent = []
+
+    async def _fake_send_task(agent_name, pid, task):
+        sent.append(task)
+
+    monkeypatch.setattr(main.redis, "send_task", _fake_send_task)
+
+    p = _project_ready_for_qa()
+    await main.advance_pipeline(p)
+
+    assert sent[0]["manual_qa_build_fix"] is False

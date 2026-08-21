@@ -700,7 +700,27 @@ def _scenario_test_cmd(test_file: str) -> list[str]:
     return ["xvfb-run", "-a", "flutter", "test", test_file]
 
 
-async def verify_scenarios(project_id: str, workspace: str, context: dict, instruction: str, already_passed: list[str]) -> dict:
+# QA가 스스로 생성한 scenario_test.dart 자체가 컴파일이 안 되는 경우(예: Flutter
+# Finder엔 없는 `.or()`/`.and()` 콤비네이터를 썼다든지)를 나타내는 flutter test
+# 출력 신호들. 이건 "앱이 요구사항을 안 지켜서" 실패한 게 아니라 QA가 방금 쓴
+# 테스트 코드 자체의 문법 오류라서, Implement에 재작업을 요청해봐야 앱 코드는
+# 이미 맞을 수 있어 예산만 날린다(recoveryfit에서 실제 재현 — MAX_QA_RETRIES
+# 3회를 이 컴파일 오류 하나가 전부 소진함, 관련 근본 원인은 대화 로그 참고).
+_BUILD_FAILURE_MARKERS = (
+    "Failed to load", "Build process failed", "Target kernel_snapshot_program failed",
+    "Compiler failed", "compilation failed",
+)
+
+
+def _looks_like_build_failure(detail: str) -> bool:
+    return any(marker in detail for marker in _BUILD_FAILURE_MARKERS)
+
+
+MAX_QA_BUILD_FIX_ROUNDS = 2  # 컴파일 실패 한정 자체 수정 시도 횟수(성공 라운드 제외)
+
+
+async def verify_scenarios(project_id: str, workspace: str, context: dict, instruction: str, already_passed: list[str],
+                            manual_build_fix: bool = False) -> dict:
     """이번 라운드에 실제로 요청된 범위(instruction)를 코드가 구현하고 있는지
     "실제로 실행해서" 검증한다. 예전엔 LLM이 소스 코드 텍스트를 읽고 "구현된
     것 같다"고 판단만 했는데(정적 리뷰) — 화면에 안 보이는 위젯도 "없다"고
@@ -783,38 +803,70 @@ async def verify_scenarios(project_id: str, workspace: str, context: dict, instr
 ## 실제 소스 코드 (lib/ 안 .dart 파일들 — 클래스/위젯 이름은 반드시 여기 있는 그대로 쓰세요)
 {source_excerpt}"""
 
-    try:
-        resp = client.messages.create(
-            model=QA_MODEL,
-            max_tokens=4096,
-            system=system_blocks,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-        _track_usage(resp)
-        code, skip_reason = _extract_scenario_test_code(resp.content[0].text, resp.stop_reason)
-        if skip_reason:
-            print(f"[qa] 시나리오 테스트 추출 건너뜀: {skip_reason}")
-            return {"verdict": "skip", "detail": skip_reason}
-    except Exception as e:
-        print(f"[qa] 시나리오 테스트 생성 실패: {e}")
-        return {"verdict": "skip", "detail": f"테스트 생성 중 에러: {e}"}
-
-    titles = _TESTWIDGETS_TITLE_RE.findall(code)
-    if not titles:
-        return {"verdict": "skip", "detail": "생성된 코드에서 testWidgets 시나리오를 못 찾음"}
-
-    test_path = f"{workspace}/{SCENARIO_TEST_FILE}"
-    os.makedirs(os.path.dirname(test_path), exist_ok=True)
-    with open(test_path, "w") as f:
-        f.write(code)
-
     ensure_integration_test_dependency(workspace)
-    result = run(_scenario_test_cmd(SCENARIO_TEST_FILE), cwd=workspace, timeout=180)
-    detail = f"{result.stdout[-1500:]}\n{result.stderr[-500:]}".strip()
-    if result.returncode == 0:
-        return {"verdict": "pass", "covered": titles, "missing": [], "detail": detail}
-    return {"verdict": "fail", "covered": [], "missing": titles,
-            "detail": f"생성된 테스트({SCENARIO_TEST_FILE})가 실행됐지만 실패했습니다:\n{detail}"}
+    messages = [{"role": "user", "content": user_prompt}]
+    test_path = f"{workspace}/{SCENARIO_TEST_FILE}"
+
+    # 라운드 0은 처음 생성, 이후 MAX_QA_BUILD_FIX_ROUNDS번은 "컴파일 실패"에만
+    # 한정된 자체 수정 재시도 — 실행은 됐는데 시나리오 자체가 실패한 경우(진짜
+    # 앱 버그일 가능성)는 여기서 재시도하지 않고 바로 fail로 보고한다(그건
+    # Implement가 고칠 문제라서).
+    for attempt in range(MAX_QA_BUILD_FIX_ROUNDS + 1):
+        try:
+            resp = client.messages.create(
+                model=QA_MODEL,
+                max_tokens=4096,
+                system=system_blocks,
+                messages=messages,
+            )
+            _track_usage(resp)
+            code, skip_reason = _extract_scenario_test_code(resp.content[0].text, resp.stop_reason)
+            if skip_reason:
+                print(f"[qa] 시나리오 테스트 추출 건너뜀: {skip_reason}")
+                return {"verdict": "skip", "detail": skip_reason}
+        except Exception as e:
+            print(f"[qa] 시나리오 테스트 생성 실패: {e}")
+            return {"verdict": "skip", "detail": f"테스트 생성 중 에러: {e}"}
+
+        titles = _TESTWIDGETS_TITLE_RE.findall(code)
+        if not titles:
+            return {"verdict": "skip", "detail": "생성된 코드에서 testWidgets 시나리오를 못 찾음"}
+
+        os.makedirs(os.path.dirname(test_path), exist_ok=True)
+        with open(test_path, "w") as f:
+            f.write(code)
+
+        result = run(_scenario_test_cmd(SCENARIO_TEST_FILE), cwd=workspace, timeout=180)
+        detail = f"{result.stdout[-1500:]}\n{result.stderr[-500:]}".strip()
+        if result.returncode == 0:
+            return {"verdict": "pass", "covered": titles, "missing": [], "detail": detail}
+
+        if not _looks_like_build_failure(detail):
+            return {"verdict": "fail", "covered": [], "missing": titles,
+                    "detail": f"생성된 테스트({SCENARIO_TEST_FILE})가 실행됐지만 실패했습니다:\n{detail}"}
+
+        if attempt < MAX_QA_BUILD_FIX_ROUNDS:
+            print(f"[qa] 생성된 테스트 컴파일 실패 — 자체 수정 재시도 {attempt + 1}/{MAX_QA_BUILD_FIX_ROUNDS}")
+            messages.append({"role": "assistant", "content": resp.content[0].text})
+            messages.append({"role": "user", "content": (
+                f"방금 작성한 테스트 코드가 컴파일에 실패했습니다:\n{detail}\n\n"
+                "이 컴파일 에러만 정확히 고치고, 나머지 시나리오/로직은 그대로 유지한 채 "
+                "파일 전체를 다시 ```dart 코드 블록 하나에 출력하세요."
+            )})
+            continue
+
+        # 자체 수정 예산을 다 썼는데도 컴파일이 안 됨 — Implement에 넘겨봐야
+        # 소용없는 QA 자신의 코드 문제이므로, manual_build_fix가 켜져 있으면
+        # 사람(Claude Code 세션)에게 넘기고, 꺼져 있으면 이번 라운드는 건너뛴다
+        # (needs_rework로 Implement를 재작업시키지 않는다 — 앱 코드는 이미 맞을
+        # 수 있어서 무한 루프만 돈다).
+        if manual_build_fix:
+            return {"verdict": "manual_pending", "code": code, "titles": titles,
+                    "detail": f"테스트 코드({SCENARIO_TEST_FILE}) 컴파일 실패, 자체 수정 {MAX_QA_BUILD_FIX_ROUNDS}회 소진:\n{detail}"}
+        return {"verdict": "skip",
+                "detail": f"테스트 코드({SCENARIO_TEST_FILE}) 컴파일 실패를 자체 수정 {MAX_QA_BUILD_FIX_ROUNDS}회 시도에도 못 고쳐 이번 라운드는 건너뜁니다:\n{detail}"}
+
+    return {"verdict": "skip", "detail": "알 수 없는 상태 — 재시도 루프가 결과 없이 끝남"}
 
 
 def _ffmpeg_transcode_cmd(src_path: str, dest_path: str) -> list[str]:
@@ -982,6 +1034,7 @@ async def process_task(r: aioredis.Redis, task: dict):
     instruction = task.get("instruction", "")
     context     = task.get("context", {})
     github_repo = task.get("github_repo", "")
+    manual_qa_build_fix = bool(task.get("manual_qa_build_fix", False))
     # implement 에이전트도 같은 shared-workspace 볼륨의 /workspace/{project_id}를
     # 자기 git 루트로 쓴다 — QA가 거기서 같이 체크아웃/빌드하면 두 에이전트가
     # 동시에 같은 프로젝트를 처리할 때 서로의 워킹트리를 덮어써서 "local changes
@@ -1043,7 +1096,27 @@ async def process_task(r: aioredis.Redis, task: dict):
 
     await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
                     "content": "🔍 PM 요구사항 대비 시나리오 구현 여부 검증 중..."})
-    scenario = await verify_scenarios(project_id, workspace, context, instruction, already_passed)
+    scenario = await verify_scenarios(project_id, workspace, context, instruction, already_passed, manual_qa_build_fix)
+    if scenario.get("verdict") == "manual_pending":
+        # QA가 자기 테스트 코드의 컴파일 실패를 자체 수정 예산 안에 못 고쳤고,
+        # manual_qa_build_fix가 켜져 있다 — Implement에 넘기지 않고(앱 코드
+        # 문제가 아니므로) 사람(Claude Code 세션)에게 직접 넘긴다. stage_completed를
+        # 안 보내고 그냥 리턴해서 qa 스테이지가 RUNNING 상태로 남아있게 하고,
+        # 사람이 POST .../stage/qa/manual-result로 완료 보고할 때까지 기다린다 —
+        # implement의 MANUAL_TASKS_DIR 우회와 동일한 파일 규칙을 그대로 재사용.
+        manual_dir = "/workspace/manual_tasks"
+        os.makedirs(manual_dir, exist_ok=True)
+        task_path = f"{manual_dir}/{project_id}_qa_qa_{int(time.time())}.json"
+        with open(task_path, "w") as f:
+            json.dump({
+                "project_id": project_id, "stage": "qa", "kind": "qa_build_fix",
+                "instruction": instruction, "broken_code": scenario.get("code", ""),
+                "titles": scenario.get("titles", []), "build_error": scenario.get("detail", ""),
+                "workspace": workspace, "test_file": SCENARIO_TEST_FILE,
+            }, f, ensure_ascii=False, indent=2)
+        await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                        "content": f"🖐 QA 테스트 코드 컴파일 실패 — 외부 처리 대기 중: {task_path}"})
+        return
     if scenario.get("verdict") == "fail":
         missing = scenario.get("missing", [])
         detail = scenario.get("detail", "")

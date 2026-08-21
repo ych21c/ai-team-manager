@@ -15,7 +15,7 @@ from run import (
     _filter_screenshot_paths, _extract_json_object, _finalize_qa_outputs,
     _resolve_target_branch, _extract_scenario_test_code, _scenario_test_cmd,
     _list_source_files, SOURCE_TOTAL_EXCERPT_LIMIT, determine_build_command,
-    _VERIFY_SCENARIOS_RULES,
+    _VERIFY_SCENARIOS_RULES, _looks_like_build_failure,
 )
 
 
@@ -371,3 +371,34 @@ def test_scenario_test_cmd_wraps_flutter_test_in_xvfb():
     assert _scenario_test_cmd("integration_test/scenario_test.dart") == [
         "xvfb-run", "-a", "flutter", "test", "integration_test/scenario_test.dart",
     ]
+
+
+# ── _looks_like_build_failure — QA 자신의 테스트 코드 컴파일 실패 감지 ────────
+
+def test_detects_real_recoveryfit_or_finder_compile_failure():
+    # recoveryfit(c052dd6b)에서 실제로 재현된 사고 — QA가 생성한 테스트에
+    # `find.text(...).or(find.text(...))`를 썼는데 Flutter Finder엔 `.or()`가
+    # 없어서 컴파일 자체가 깨졌다. 이걸 "시나리오 실패"로 착각해 Implement에
+    # 재작업을 요청했지만 앱 코드는 멀쩡했고, MAX_QA_RETRIES 3회를 이 컴파일
+    # 오류 하나로 전부 날렸다(이 세션에서 실제 로그로 확인).
+    detail = (
+        "ERROR:           find.text('이용 전 꼭 확인하세요').or(find.text('동의하고 시작')),\n"
+        "ERROR:                                     ^^\n"
+        "ERROR: Target kernel_snapshot_program failed: Exception\n"
+        "00:00 +0 -1: loading /workspace/c052dd6b-qa-clone/integration_test/scenario_test.dart [E]\n"
+        '  Failed to load "/workspace/c052dd6b-qa-clone/integration_test/scenario_test.dart": Build process failed\n'
+    )
+    assert _looks_like_build_failure(detail) is True
+
+
+def test_does_not_flag_genuine_test_assertion_failure_as_build_failure():
+    # 코드는 정상적으로 컴파일/실행됐고, 실제 시나리오가 기대와 달라서(진짜 앱
+    # 버그일 가능성) 실패한 경우는 Implement 재작업 대상이 맞으므로 build
+    # failure로 오판하면 안 된다.
+    detail = (
+        "00:03 +2 -1: 랜딩 화면 CTA 버튼 탭 시 면책동의 화면으로 진입 [E]\n"
+        "  Expected: exactly one matching candidate\n"
+        "  Actual: _TextWidgetFinder:<Found 0 widgets with text \"동의하고 시작\">\n"
+        "   Which: means none were found but one was expected\n"
+    )
+    assert _looks_like_build_failure(detail) is False
