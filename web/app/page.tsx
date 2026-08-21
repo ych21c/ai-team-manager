@@ -201,6 +201,18 @@ const INITIAL_AGENTS = (): AgentState[] => [
   { name: "release",   label: "Release",   status: "pending", progress: 0, lastMessage: "" },
 ];
 
+// 새로고침/재접속 직후엔 agentMap이 INITIAL_AGENTS()로 비어 있어서, 실제로는
+// implement가 한창 실행 중이어도 다음 agent_message가 올 때까지 화면엔 "지금
+// 뭐 하는지"가 안 보이는 공백이 있었다 — 서버가 이미 복원해서 보내주는 채팅
+// 이력(messages)에서 에이전트별 마지막 발언을 찾아 lastMessage를 미리 채운다.
+const seedAgentsFromMessages = (messages?: Message[]): AgentState[] => {
+  const byName = Object.fromEntries(INITIAL_AGENTS().map(a => [a.name, a])) as Record<string, AgentState>;
+  (messages ?? []).forEach(m => {
+    if (byName[m.from]) byName[m.from] = { ...byName[m.from], lastMessage: m.content.slice(0, 80) };
+  });
+  return Object.values(byName);
+};
+
 // ── 상태 배지 ────────────────────────────────────────────────────
 function StatusBadge({ status }: { status: AgentStatus }) {
   const map: Record<AgentStatus, [string, string]> = {
@@ -232,6 +244,26 @@ function TaskDetail({ task }: { task?: CurrentTask }) {
       <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 90, overflow: "auto" }}>
         {task.instruction.slice(0, 1000)}
       </div>
+    </div>
+  );
+}
+
+// 에이전트가 실행 중 보고하는 세부 진행 메시지(예: implement의 "🤖 OpenHands 실행
+// 중" → "📦 APK 빌드 완료" → "✅ PR 생성 완료")를 실시간으로 보여준다 — WS
+// agent_message가 올 때마다 상위(App)의 agentMap이 갱신되고 그 값이 그대로
+// 여기로 흘러오므로 폴링 없이 즉시 반영된다. TaskDetail(무슨 지시를 받았는지,
+// 정적)과 달리 이건 "지금 그래서 뭘 하고 있는지"(동적) 담당.
+function LiveStep({ agent }: { agent?: AgentState }) {
+  if (!agent?.lastMessage) return null;
+  const isRunning = agent.status === "running";
+  return (
+    <div style={{
+      fontSize: 11.5, display: "flex", alignItems: "center", gap: 6, padding: "5px 8px",
+      background: isRunning ? "#FAEEDA" : "#f5f4f0", border: `0.5px solid ${isRunning ? "#F0DCAE" : "#e5e5e5"}`,
+      borderRadius: 6, color: isRunning ? "#854F0B" : "#888",
+    }}>
+      {isRunning && <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#E8A93D", flexShrink: 0 }} />}
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.lastMessage}</span>
     </div>
   );
 }
@@ -722,7 +754,7 @@ function DecisionBlock({ editTarget, gateTarget, stages, jira, draft, setDraft, 
 
 function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpand, onOpenDesign, jira,
                     editing, onStartEdit, onCancelEdit, draft, setDraft, busy, onRun, onDiscard,
-                    manualImplement, onSetManualImplement }: {
+                    manualImplement, onSetManualImplement, agentByName }: {
   name: StageName; stageInfo?: StageInfo; projectId: string; isActive: boolean;
   expanded: boolean; onToggleExpand: () => void; onOpenDesign: () => void; jira?: JiraInfo;
   editing: Record<string, boolean>; onStartEdit: (stage: string) => void; onCancelEdit: (stage: string) => void;
@@ -731,6 +763,7 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
   busy: Record<string, boolean>; onRun: (stage: string, feedback: string, scenarioKeys?: string[]) => void;
   onDiscard: (stage: string) => void;
   manualImplement?: boolean; onSetManualImplement?: (enabled: boolean) => void;
+  agentByName: Record<string, AgentState>;
 }) {
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const scopable = name === "design" || name === "implement";
@@ -830,7 +863,8 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
                         {String(aSummary).slice(0, 1500)}
                       </div>
                     )}
-                    <div style={{ marginTop: 4 }}>
+                    <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 4 }}>
+                      <LiveStep agent={agentByName[a]} />
                       <TaskDetail task={stageInfo?.current_task?.[a]} />
                     </div>
                   </div>
@@ -844,6 +878,7 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
                   {String(outputs.summary).slice(0, 2000)}
                 </div>
               )}
+              <LiveStep agent={agentByName[meta.agents[0]]} />
               <TaskDetail task={stageInfo?.current_task?.[meta.agents[0]]} />
             </>
           )}
@@ -921,9 +956,10 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
   );
 }
 
-function FlowchartTab({ project, projectId, onOpenDesign }: {
-  project: Project | undefined; projectId: string; onOpenDesign: () => void;
+function FlowchartTab({ project, projectId, agents, onOpenDesign }: {
+  project: Project | undefined; projectId: string; agents: AgentState[]; onOpenDesign: () => void;
 }) {
+  const agentByName = Object.fromEntries(agents.map(a => [a.name, a])) as Record<string, AgentState>;
   const stages = project?.stages;
   const activeGate = getActiveGateStage(stages);
   const [draft, setDraft]     = useState<Record<string, string>>({});
@@ -1032,6 +1068,7 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
               draft={draft} setDraft={setDraft} busy={busy}
               onRun={runStage} onDiscard={discardStage}
               manualImplement={project?.manual_implement} onSetManualImplement={setManualImplement}
+              agentByName={agentByName}
             />
             {next && (
               showGate ? (
@@ -1583,7 +1620,7 @@ export default function Home() {
         // 서버가 들고 있는 채팅 이력으로 복원 (새로고침으로 WS가 재연결돼도
         // 대화가 안 사라지게) — 서버 쪽에 기록이 없으면 기존 로컬 상태 유지.
         setMsgMap(prev => Object.fromEntries(ids.map(id => [id, raw[id]?.messages ?? prev[id] ?? []])));
-        setAgentMap(prev => Object.fromEntries(ids.map(id => [id, prev[id] ?? INITIAL_AGENTS()])));
+        setAgentMap(prev => Object.fromEntries(ids.map(id => [id, prev[id] ?? seedAgentsFromMessages(raw[id]?.messages)])));
       }
     }
 
@@ -1810,7 +1847,7 @@ export default function Home() {
   );
 
   const flowchartContent = (
-    <FlowchartTab project={activeProject} projectId={activeId} onOpenDesign={() => setDesignOpen(true)} />
+    <FlowchartTab project={activeProject} projectId={activeId} agents={agents} onOpenDesign={() => setDesignOpen(true)} />
   );
 
   // ── 채팅 영역 (공통) ──────────────────────────────────────────
