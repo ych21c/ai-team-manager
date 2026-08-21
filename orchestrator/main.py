@@ -1994,12 +1994,15 @@ async def get_design_history_file(project_id: str, key: str, version: str):
 async def retry_implement(project_id: str, body: RetryFeedback):
     """qa 자동 재시도(MAX_QA_RETRIES)가 소진돼 FAILED로 멈춘 프로젝트를, 사람이
     직접 확인한 정확한 피드백으로 한 번 더 implement에 재작업 요청할 때 쓰는
-    수동 개입용 엔드포인트. qa_retry_counts는 건드리지 않는다 — 이건 자동
-    루프가 아니라 사람이 원인 파악 후 넣는 수동 트리거이므로."""
+    수동 개입용 엔드포인트. qa_retry_counts를 0으로 리셋한다 — 리셋하지 않으면
+    카운터가 이미 MAX_QA_RETRIES에 도달해 있어서, 이번에 사람이 원인을 고쳐
+    보내도 다음 QA/AutoTest 실패 때 자동 재작업 없이 곧장 다시 FAILED로
+    멈춰버려 매번 수동 개입을 반복해야 했다."""
     p = projects.get(project_id)
     if not p:
         raise HTTPException(404)
-    await _add_history(project_id, f"🔁 QA 재작업 요청 (수동, retry 예산 소진 후 개입): {body.feedback}")
+    qa_retry_counts[project_id] = 0
+    await _add_history(project_id, f"🔁 QA 재작업 요청 (수동, retry 예산 소진 후 개입 — retry 카운트 리셋): {body.feedback}")
     await _retry_implement_with_feedback(p, body.feedback, [body.scenario_key] if body.scenario_key else None)
     return {"ok": True}
 
