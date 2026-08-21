@@ -18,7 +18,11 @@ interface StageOutputs {
   input_tokens?: number; output_tokens?: number; cost_usd?: number;
   needs_rework?: boolean; feedback?: string;
 }
-interface StageInfo { status: string; agents: string[]; outputs?: StageOutputs; approved?: boolean; agents_done?: string[]; }
+interface CurrentTask { instruction: string; dispatched_at: number; manual: boolean; }
+interface StageInfo {
+  status: string; agents: string[]; outputs?: StageOutputs; approved?: boolean; agents_done?: string[];
+  current_task?: Record<string, CurrentTask>;
+}
 interface Message {
   id: string; from: string; content: string; ts: number; video?: string;
 }
@@ -49,6 +53,7 @@ interface Project {
   sprint?: number;
   deploy_config?: DeployConfig;
   deploy_status?: DeployStatus;
+  manual_implement?: boolean;
 }
 interface ApprovalRequest {
   project_id: string; stage: string; message: string;
@@ -209,6 +214,26 @@ function StatusBadge({ status }: { status: AgentStatus }) {
   };
   const [bg, color] = map[status];
   return <span style={{ background: bg, color, fontSize: 11, padding: "2px 8px", borderRadius: 20, whiteSpace: "nowrap" }}>{label[status]}</span>;
+}
+
+// 로그(원시 텍스트 스트림)와 별개로, 이 에이전트가 마지막/현재 라운드에 실제로
+// 무엇을 지시받았는지(instruction) 구조화해서 보여준다 — 완료/실패 후에도 남아있어
+// "이 결과가 애초에 뭘 요청한 라운드였는지" 확인 가능. 재시작은 새 버튼을 따로
+// 만들지 않고 같은 패널의 기존 취소/재실행 버튼을 그대로 쓴다(바로 옆에 노출).
+function TaskDetail({ task }: { task?: CurrentTask }) {
+  if (!task || !task.instruction) return null;
+  const time = new Date(task.dispatched_at * 1000).toLocaleString("ko-KR", { hour12: false });
+  return (
+    <div style={{ fontSize: 11, color: "#777", background: "#fafafa", border: "0.5px solid #eee", borderRadius: 6, padding: "6px 8px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", color: "#aaa", marginBottom: 3 }}>
+        <span>태스크 · {time}</span>
+        {task.manual && <span style={{ color: "#6B3FA0" }}>🖐 수동 처리</span>}
+      </div>
+      <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 90, overflow: "auto" }}>
+        {task.instruction.slice(0, 1000)}
+      </div>
+    </div>
+  );
 }
 
 // ── 에이전트 실행 로그 뷰어 (DetailPanel + 플로우차트 노드 공용) ──────
@@ -696,7 +721,8 @@ function DecisionBlock({ editTarget, gateTarget, stages, jira, draft, setDraft, 
 }
 
 function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpand, onOpenDesign, jira,
-                    editing, onStartEdit, onCancelEdit, draft, setDraft, busy, onRun, onDiscard }: {
+                    editing, onStartEdit, onCancelEdit, draft, setDraft, busy, onRun, onDiscard,
+                    manualImplement, onSetManualImplement }: {
   name: StageName; stageInfo?: StageInfo; projectId: string; isActive: boolean;
   expanded: boolean; onToggleExpand: () => void; onOpenDesign: () => void; jira?: JiraInfo;
   editing: Record<string, boolean>; onStartEdit: (stage: string) => void; onCancelEdit: (stage: string) => void;
@@ -704,6 +730,7 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
   setDraft: (fn: (d: Record<string, string>) => Record<string, string>) => void;
   busy: Record<string, boolean>; onRun: (stage: string, feedback: string, scenarioKeys?: string[]) => void;
   onDiscard: (stage: string) => void;
+  manualImplement?: boolean; onSetManualImplement?: (enabled: boolean) => void;
 }) {
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const scopable = name === "design" || name === "implement";
@@ -763,6 +790,18 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
               게이트 통과 후 자동 시작 — 입력은 이전 스테이지 산출물
             </div>
           )}
+          {name === "implement" && onSetManualImplement && (
+            <label style={{
+              display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#666",
+              background: manualImplement ? "#F5F0FA" : "#fff",
+              border: `0.5px solid ${manualImplement ? "#D9C7EC" : "#e5e5e5"}`,
+              borderRadius: 6, padding: "6px 8px", width: "fit-content", cursor: "pointer",
+            }} title="켜면 컨테이너 에이전트(API 과금) 대신 외부 세션이 이 코드를 직접 작성합니다 — QA 검증은 항상 그대로 자동으로 돕니다.">
+              <input type="checkbox" checked={!!manualImplement}
+                onChange={e => onSetManualImplement(e.target.checked)} />
+              🖐 수동 처리(외부 세션이 코드 작성)
+            </label>
+          )}
           {meta.agents.length > 1 ? (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {meta.agents.map(a => {
@@ -791,14 +830,22 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
                         {String(aSummary).slice(0, 1500)}
                       </div>
                     )}
+                    <div style={{ marginTop: 4 }}>
+                      <TaskDetail task={stageInfo?.current_task?.[a]} />
+                    </div>
                   </div>
                 );
               })}
             </div>
-          ) : outputs?.summary && (
-            <div style={{ fontSize: 12, lineHeight: 1.6, background: "#fff", border: "0.5px solid #e5e5e5", borderRadius: 6, padding: "8px 10px", maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap" }}>
-              {String(outputs.summary).slice(0, 2000)}
-            </div>
+          ) : (
+            <>
+              {outputs?.summary && (
+                <div style={{ fontSize: 12, lineHeight: 1.6, background: "#fff", border: "0.5px solid #e5e5e5", borderRadius: 6, padding: "8px 10px", maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap" }}>
+                  {String(outputs.summary).slice(0, 2000)}
+                </div>
+              )}
+              <TaskDetail task={stageInfo?.current_task?.[meta.agents[0]]} />
+            </>
           )}
           {(outputs?.pr_url || outputs?.branch) && (
             <div style={{ fontSize: 11.5 }}>
@@ -806,6 +853,13 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
                 ? <a href={outputs.pr_url} target="_blank" rel="noreferrer" style={{ color: "#7F77DD" }}>{outputs.pr_url}</a>
                 : <span style={{ fontFamily: "monospace", color: "#666" }}>{outputs?.branch}</span>}
             </div>
+          )}
+          {name === "qa" && status !== "running" && (
+            <button onClick={() => onRun("qa", "")} disabled={busy[name]}
+              style={{ ...flowBtnStyle, alignSelf: "flex-start", background: "#EAF3DE", borderColor: "#C0DD97", color: "#3B6D11" }}
+              title="implement 상태와 무관하게 지금 워크스페이스 코드로 QA(컨테이너 에이전트) 검증만 바로 다시 돌립니다.">
+              {busy[name] ? "실행 중..." : "🧪 밸리데이션만 실행"}
+            </button>
           )}
           {name === "design" && (
             <button onClick={onOpenDesign} style={{ ...flowBtnStyle, alignSelf: "flex-start", background: "#fff" }}>🎨 디자인 보기</button>
@@ -916,6 +970,8 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
   const discardStage = (stage: string) => withBusy(stage, () => post(`/projects/${projectId}/stage/${stage}/discard`));
   const approveStage = (stage: string, extraInput?: string) => withBusy(stage, () =>
     post(`/projects/${projectId}/approve/${stage}`, extraInput ? { extra_input: extraInput } : {}));
+  const setManualImplement = (enabled: boolean) => withBusy("manual_implement", () =>
+    post(`/projects/${projectId}/manual-implement`, { enabled }));
 
   const totals = project?.token_totals;
   const currentSprintTotals = totals?.by_sprint?.[String(project?.sprint ?? 1)];
@@ -975,6 +1031,7 @@ function FlowchartTab({ project, projectId, onOpenDesign }: {
               onCancelEdit={n => setEditing(v => ({ ...v, [n]: false }))}
               draft={draft} setDraft={setDraft} busy={busy}
               onRun={runStage} onDiscard={discardStage}
+              manualImplement={project?.manual_implement} onSetManualImplement={setManualImplement}
             />
             {next && (
               showGate ? (

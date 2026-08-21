@@ -49,6 +49,19 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://thrive-estate-vindicate.
 # 서비스로 유지한다. 나머지 역할만 TeamSpawner가 프로젝트별 컨테이너로 격리해서 띄운다.
 GLOBAL_SHARED_AGENTS = {"implement", "autotest", "qa"}
 
+# implement 스테이지만 대상 — QA는 코드가 실제로 요구사항을 만족하는지 검증하는
+# 안전장치라 항상 컨테이너 에이전트(정상 토큰 과금 경로)로 돌아야 한다는 게
+# 명시적 결정. project_manual_implement[pid]가 True인 프로젝트는 implement
+# 태스크를 큐(redis.send_task) 대신 MANUAL_TASKS_DIR에 파일로만 써놓고 사람
+# (Claude Code 세션)이 대신 코딩하게 한다 — API 토큰 과금 없이 이미 구독 중인
+# 세션으로 처리하기 위한 비용 절감용 우회. 프로젝트마다, 그리고 그때그때
+# (컨테이너 재시작 없이) 켜고 끌 수 있어야 해서 .env 전역 플래그가 아니라
+# 프로젝트별 런타임 상태로 둔다 — POST /projects/{id}/manual-implement로 토글.
+# 완료되면 POST .../manual-result로 통상적인 stage_completed 이벤트와 동일하게
+# 넘겨서, 이후 로직(재시도 라우팅/토큰 집계/jira 코멘트 등)은 그대로 재사용한다.
+project_manual_implement: dict[str, bool] = {}
+MANUAL_TASKS_DIR = "/workspace/manual_tasks"
+
 # ── 전역 상태 ────────────────────────────────────────────────────────
 projects:       dict[str, Pipeline] = {}
 project_names:  dict[str, str]     = {}   # project_id → 표시명
@@ -228,6 +241,7 @@ def _load_all_projects():
             pipeline.stages[stage_name].outputs = stage_data.get("outputs") or {}
             pipeline.stages[stage_name].approved = bool(stage_data.get("approved", False))
             pipeline.stages[stage_name].agents_done = list(stage_data.get("agents_done") or [])
+            pipeline.stages[stage_name].current_task = dict(stage_data.get("current_task") or {})
 
         projects[pid]      = pipeline
         project_names[pid] = data.get("name", pid)
@@ -243,6 +257,8 @@ def _load_all_projects():
             project_token_totals[pid] = _migrate_token_totals(data["token_totals"])
         if data.get("qa_retry_count"):
             qa_retry_counts[pid] = data["qa_retry_count"]
+        if data.get("manual_implement"):
+            project_manual_implement[pid] = True
         if data.get("deploy_config"):
             project_deploy_config[pid] = data["deploy_config"]
         if data.get("deploy_status"):
@@ -1019,6 +1035,38 @@ async def _retry_planning_with_feedback(
     await advance_pipeline(pipeline)
 
 
+async def _send_task_or_manual(pipeline: Pipeline, agent_name: str, stream_project_id: str | None, stage_name: str, task: dict):
+    """redis.send_task의 공용 앞단 — project_manual_implement[pid]가 켜진 프로젝트의
+    implement 스테이지는 컨테이너 큐 대신 MANUAL_TASKS_DIR에 태스크 파일만 쓰고
+    사람(Claude Code 세션)이 완료 후 POST .../manual-result로 보고하게 한다.
+    QA는 대상이 아니다(항상 컨테이너 에이전트로 검증) — 그래서 stage_name이
+    "implement"인지 먼저 확인한다. advance_pipeline의 최초 디스패치뿐 아니라
+    _retry_implement_with_feedback(QA 실패 후 재작업 등)도 전부 이 함수를
+    거쳐야 한다 — 재시도 라운드가 API 과금이 가장 자주 발생하는 경로라 거기를
+    놓치면 비용 절감 효과가 거의 없다.
+
+    디스패치 방식과 무관하게(큐로 나가든 수동 파일로 쓰이든) 항상 이 에이전트가
+    "지금 실제로 뭘 지시받았는지"를 stage.current_task에 스냅샷으로 남긴다 —
+    플로우차트 탭이 원시 로그 대신 구조화된 태스크 상세를 보여주는 용도."""
+    pipeline.stages[stage_name].current_task[agent_name] = {
+        "instruction": task.get("instruction", ""),
+        "dispatched_at": time.time(),
+        "manual": stage_name == "implement" and project_manual_implement.get(task["project_id"], False),
+    }
+    if stage_name == "implement" and project_manual_implement.get(task["project_id"], False):
+        os.makedirs(MANUAL_TASKS_DIR, exist_ok=True)
+        task_path = f"{MANUAL_TASKS_DIR}/{task['project_id']}_{stage_name}_{agent_name}_{int(time.time())}.json"
+        with open(task_path, "w") as f:
+            json.dump(task, f, ensure_ascii=False, indent=2)
+        print(f"[manual] '{stage_name}'({agent_name}) 태스크 큐 대신 파일로 기록: {task_path}")
+        await broadcast({
+            "type": "agent_message", "project_id": task["project_id"], "agent": "system",
+            "content": f"🖐 '{stage_name}' 스테이지는 수동 처리 모드 — 태스크가 {task_path}에 대기 중입니다.",
+        })
+        return
+    await redis.send_task(agent_name, stream_project_id, task)
+
+
 _NO_BLIND_REVERT_GUIDANCE = (
     "중요: 테스트가 실패한다고 무조건 앱 코드를 옛날 상태로 되돌리지 마세요. "
     "`git log --oneline -5`로 최근 커밋 메시지를 먼저 확인해서, 최근에 의도적으로 "
@@ -1086,7 +1134,7 @@ async def _retry_implement_with_feedback(pipeline: Pipeline, feedback: str, scen
 
     pipeline.mark_running("implement")
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "implement", "status": "running"})
-    await redis.send_task("implement", None, {
+    await _send_task_or_manual(pipeline, "implement", None, "implement", {
         "project_id": pid,
         "stage": "implement",
         "instruction": instruction,
@@ -1167,7 +1215,7 @@ async def _retry_qa_with_feedback(pipeline: Pipeline, feedback: str):
 
     pipeline.mark_running("qa")
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "qa", "status": "running"})
-    await redis.send_task("qa", None, {
+    await _send_task_or_manual(pipeline, "qa", None, "qa", {
         "project_id": pid, "stage": "qa", "instruction": instruction,
         "context": context, "github_repo": project_repos.get(pid, ""),
     })
@@ -1188,7 +1236,7 @@ async def _retry_autotest_with_feedback(pipeline: Pipeline, feedback: str):
 
     pipeline.mark_running("autotest")
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "autotest", "status": "running"})
-    await redis.send_task("autotest", None, {
+    await _send_task_or_manual(pipeline, "autotest", None, "autotest", {
         "project_id": pid, "stage": "autotest", "instruction": instruction,
         "context": context, "github_repo": project_repos.get(pid, ""),
     })
@@ -1210,7 +1258,7 @@ async def _retry_release_with_feedback(pipeline: Pipeline, feedback: str):
 
     pipeline.mark_running("release")
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "release", "status": "running"})
-    await redis.send_task("release", pid, {
+    await _send_task_or_manual(pipeline, "release", pid, "release", {
         "project_id": pid, "stage": "release", "instruction": instruction,
         "context": context, "github_repo": project_repos.get(pid, ""),
     })
@@ -1348,11 +1396,12 @@ async def advance_pipeline(pipeline: Pipeline):
             # 리스트라 이 조건이 아무것도 걸러내지 않는다.
             if agent_name in stage.agents_done:
                 continue
+
             # implement/autotest는 전역 공유 싱글턴(docker-compose 정적 서비스) — 큐도 전역.
             # 나머지(pm/designer/architect/qa/release)는 TeamSpawner가 프로젝트별로 격리해서
             # 띄우므로 큐도 프로젝트별로 분리해야 서로 태스크를 중복으로 가져가지 않는다.
             stream_project_id = None if agent_name in GLOBAL_SHARED_AGENTS else pipeline.project_id
-            await redis.send_task(agent_name, stream_project_id, {
+            await _send_task_or_manual(pipeline, agent_name, stream_project_id, stage.name, {
                 "project_id": pipeline.project_id,
                 "stage": stage.name,
                 "instruction": pipeline.instruction,
@@ -1379,6 +1428,7 @@ def _make_project_info(pid: str) -> dict:
         },
         "deploy_config": project_deploy_config.get(pid, {}),
         "deploy_status": project_deploy_status.get(pid, {"status": "idle"}),
+        "manual_implement": project_manual_implement.get(pid, False),
     }
 
 
@@ -1974,6 +2024,51 @@ async def rerun_stage(project_id: str, stage_name: str, body: StageRerun):
         raise HTTPException(400, f"알 수 없는 스테이지: {stage_name}")
 
     await _add_history(project_id, f"↺ '{stage_name}' 재실행: {feedback}")
+    return {"ok": True}
+
+
+class ManualImplementToggle(BaseModel):
+    enabled: bool
+
+
+@app.post("/projects/{project_id}/manual-implement")
+async def set_manual_implement(project_id: str, body: ManualImplementToggle):
+    """implement 스테이지를 사람(Claude Code 세션)이 처리할지 컨테이너 에이전트가
+    처리할지 프로젝트별로, 그때그때 토글한다 — .env 전역 플래그였다면 값을 바꿀
+    때마다 orchestrator 컨테이너를 재시작해야 해서 이렇게 런타임 상태로 뒀다.
+    이미 큐로 나간(또는 이미 파일로 대기 중인) 진행 중 태스크에는 영향 없고,
+    다음 디스패치(_send_task_or_manual)부터 적용된다."""
+    if project_id not in projects:
+        raise HTTPException(404)
+    project_manual_implement[project_id] = body.enabled
+    _save_project(project_id)
+    await _add_history(project_id, f"🖐 implement 수동 처리 모드 {'켜짐' if body.enabled else '꺼짐'}")
+    await broadcast({"type": "project_updated", "project_id": project_id, "projects": {pid: _make_project_info(pid) for pid in projects}})
+    return {"ok": True, "manual_implement": body.enabled}
+
+
+class ManualStageResult(BaseModel):
+    agent: str
+    outputs: dict
+
+
+@app.post("/projects/{project_id}/stage/{stage_name}/manual-result")
+async def manual_stage_result(project_id: str, stage_name: str, body: ManualStageResult):
+    """project_manual_implement로 큐 대신 파일로 넘긴 태스크(_send_task_or_manual
+    참고)를 사람이 (Claude Code 세션으로) 직접 처리한 뒤 결과를 넣는 입구. 컨테이너 에이전트가
+    STREAM_EVENTS에 stage_completed를 xadd하는 것과 동일한 효과를 내야 재시도
+    라우팅(_route_needs_rework_or_fail)/토큰 집계/jira 코멘트 등 기존 완료 처리
+    로직을 그대로 재사용할 수 있어서, 새 로직을 만들지 않고 handle_agent_event를
+    그대로 호출한다 — 실제 에이전트가 보낸 이벤트와 구분이 안 되는 동일 경로."""
+    if project_id not in projects:
+        raise HTTPException(404)
+    await handle_agent_event({
+        "project_id": project_id,
+        "agent": body.agent,
+        "type": "stage_completed",
+        "stage": stage_name,
+        "outputs": body.outputs,
+    })
     return {"ok": True}
 
 

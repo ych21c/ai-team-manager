@@ -59,6 +59,13 @@ class Stage:
     # 태스크 발송 루프도 이미 agents_done에 있는 에이전트는 건너뛴다. scenario_scope와
     # 마찬가지로 다음 실행 한 번만 적용되고 advance_pipeline이 바로 False로 되돌린다.
     keep_agents_done: bool = False
+    # agent_name → {"instruction", "dispatched_at", "manual"} — 이 스테이지의 각
+    # 에이전트에게 실제로 마지막에 dispatch된 태스크 스냅샷. 플로우차트 탭에서
+    # "지금/마지막으로 이 에이전트가 정확히 뭘 하고 있(었)는지"를 원시 로그가
+    # 아니라 구조화된 형태로 보여주기 위함 — _send_task_or_manual이 dispatch
+    # 시점마다 채운다. 완료돼도 지우지 않는다(끝난 뒤에도 "무슨 태스크였는지"
+    # 확인할 수 있어야 하고, 다음 라운드 dispatch 때 자연히 덮어써진다).
+    current_task: dict = field(default_factory=dict)
 
 
 PIPELINE_DEFINITION: list[Stage] = [
@@ -166,6 +173,7 @@ class Pipeline:
                 name: {
                     "status": s.status, "agents": s.agents, "outputs": s.outputs,
                     "approved": s.approved, "agents_done": s.agents_done,
+                    "current_task": s.current_task,
                 }
                 for name, s in self.stages.items()
             }
