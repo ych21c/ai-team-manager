@@ -181,22 +181,46 @@ async def create_jira_stories(epic_key: str, project_name: str, requirements: li
                 title = str(req.get("title") or req.get("id") or req)[:200]
             else:
                 title = str(req)[:200]
+            fields = {
+                "project": {"key": JIRA_PK},
+                "summary": title,
+                "issuetype": {"name": story_type},
+                "parent": {"key": epic_key},
+            }
             r = await client.post(
                 f"https://{DOMAIN}/rest/api/3/issue",
                 headers=_auth_header(),
-                json={
-                    "fields": {
-                        "project": {"key": JIRA_PK},
-                        "summary": title,
-                        "issuetype": {"name": story_type},
-                        "parent": {"key": epic_key},
-                    }
-                },
+                json={"fields": fields},
             )
+            parent_linked = True
+            if r.status_code != 201:
+                errors = {}
+                try:
+                    errors = r.json().get("errors", {})
+                except Exception:
+                    pass
+                # epic_key가 실제로는 Epic 계층(hierarchyLevel>0)이 아닌 경우
+                # (예: 이 프로젝트가 처음 만들어질 때는 Epic 타입이 없어 "작업"으로
+                # 대체 생성됐다가, 나중에 진짜 Epic 타입이 추가되면서 더 이상 유효한
+                # parent로 인정 안 되는 경우) Jira가 parent/parentId 필드를 콕
+                # 집어 400을 준다 — 이때는 parent 없이라도 이슈 자체는 만들어서
+                # "새 요구사항이 아예 안 만들어짐"보다 "Epic에 안 걸림"이 낫게 한다.
+                if "parent" in errors or "parentId" in errors:
+                    print(f"[jira] '{epic_key}'가 유효한 Epic parent가 아니라 연결 없이 재시도합니다: {errors}")
+                    fallback_fields = {k: v for k, v in fields.items() if k != "parent"}
+                    r = await client.post(
+                        f"https://{DOMAIN}/rest/api/3/issue",
+                        headers=_auth_header(),
+                        json={"fields": fallback_fields},
+                    )
+                    parent_linked = False
             if r.status_code == 201:
                 key = r.json().get("key")
                 subtasks = await create_stage_subtasks(key, title)
-                stories.append({"key": key, "title": title, "subtasks": subtasks})
+                story = {"key": key, "title": title, "subtasks": subtasks}
+                if not parent_linked:
+                    story["parent_linked"] = False
+                stories.append(story)
             else:
                 print(f"[jira] Story 생성 실패 ({r.status_code}): {r.text[:300]}")
     return stories

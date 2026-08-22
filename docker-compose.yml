@@ -164,6 +164,7 @@ services:
     build:
       context: ./agents/qa_testlab
       dockerfile: Dockerfile
+    init: true
     env_file: .env
     environment:
       AGENT_NAME: qa

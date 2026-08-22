@@ -82,6 +82,15 @@ project_jira:   dict[str, dict]    = {}   # project_id → { epic, stories, conf
 project_docs:   dict[str, dict]    = {}   # project_id → { overview, architecture, history:[...], confluence_page_id }
 project_messages: dict[str, list[dict]] = {}   # project_id → 채팅 메시지 이력 (새로고침 시 복원용)
 MAX_STORED_MESSAGES = 300   # 프로젝트당 메모리 상한
+# project_id → agent → phase_id → {label, status, detail, ts} — web/app/page.tsx
+# PhaseTimeline이 그리는 단계별 칩의 서버 쪽 사본. agent_phase 이벤트는 원래
+# 연결된 WS 클라이언트에게만 방송되고 어디에도 저장되지 않아서, 새로고침하거나
+# 탭을 새로 열면(WS는 재연결돼도) 그 세션이 연결되기 전에 지나간 단계들은
+# 영영 복원이 안 돼 QA 카드에 칩이 하나도 안 보이는 문제가 있었다(lastMessage는
+# project_messages로 이미 복원되는데 phases만 빠져있었음). 여기 저장해뒀다가
+# _make_project_info로 내려주면 프론트가 최초 로드 때 seedAgentsFromMessages와
+# 같은 방식으로 칩을 복원한다.
+project_phases: dict[str, dict[str, dict[str, dict]]] = {}
 # project_id → {"by_sprint": {"1": {"planning": {input_tokens,output_tokens,cost_usd}, "design": {...}, ...}, "2": {...}},
 #               "pre_migration": {input_tokens,output_tokens,cost_usd} | None}
 # 스프린트(전체 재기획 회차) × 스테이지 단위로 누적한다 — outputs["input_tokens"/
@@ -199,6 +208,17 @@ def _store_message(project_id: str, frm: str, content: str):
     if len(lst) > MAX_STORED_MESSAGES:
         del lst[: len(lst) - MAX_STORED_MESSAGES]
     _append_chat_log(project_id, msg)
+
+
+def _clear_phases(pid: str, agent_names: list[str]):
+    """새 라운드가 시작될 때(stage_update running) 지난 라운드 칩을 지운다 —
+    web/app/page.tsx의 agent_phase 핸들러(같은 이름의 로직)와 타이밍을 맞춰야,
+    새로고침 직후 복원되는 칩이 이전 라운드 것과 섞이지 않는다."""
+    phases = project_phases.get(pid)
+    if not phases:
+        return
+    for name in agent_names:
+        phases.pop(name, None)
 
 
 def _save_project(pid: str):
@@ -636,6 +656,29 @@ async def handle_agent_event(event: dict):
             "progress": event.get("progress", 0),
             "message": event.get("message", ""),
         })
+    elif event_type == "agent_phase":
+        # QA(그리고 향후 다른 에이전트)가 "빌드 시작/성공, 코드 자체 수정,
+        # 실기기 테스트 제출/대기" 같은 세부 작업 단위를 그대로 브라우저에
+        # 넘긴다 — 웹은 이걸 스크롤되는 채팅이 아니라 에이전트 카드에 고정된
+        # 단계별 마커로 그린다(web/app/page.tsx의 agent_phase 핸들러).
+        phase_id = event.get("phase", "")
+        # project_messages와 동일하게 서버에도 최신 상태를 남겨둔다 — 그래야
+        # 이 이벤트가 지나간 뒤에 새로 연결된 탭도 _make_project_info를 통해
+        # 지금까지의 칩을 그대로 복원할 수 있다(위 project_phases 주석 참고).
+        project_phases.setdefault(project_id, {}).setdefault(agent_name, {})[phase_id] = {
+            "label": event.get("label", ""), "status": event.get("status", ""),
+            "detail": event.get("detail", ""), "ts": int(time.time() * 1000),
+        }
+        await broadcast({
+            "type": "agent_phase",
+            "project_id": project_id,
+            "agent": agent_name,
+            "stage": event.get("stage", ""),
+            "phase": phase_id,
+            "label": event.get("label", ""),
+            "status": event.get("status", ""),
+            "detail": event.get("detail", ""),
+        })
 
 
 async def setup_git_repo(pipeline: Pipeline) -> str | None:
@@ -773,7 +816,16 @@ async def _route_needs_rework_or_fail(pipeline: Pipeline, project_id: str, stage
     """QA/AutoTest 실패를 Implement 재작업으로 돌릴지, 예산을 다 써서 멈추고
     사람을 부를지 결정한다. 두 스테이지가 같은 카운터(qa_retry_counts)를
     공유해서, 어느 쪽에서 실패가 반복되든 총 MAX_QA_RETRIES회로 묶인다 —
-    "QA 3번 + AutoTest 3번"처럼 재시도가 배로 불어나는 걸 막는다."""
+    "QA 3번 + AutoTest 3번"처럼 재시도가 배로 불어나는 걸 막는다.
+
+    예산이 소진됐을 때, 이 프로젝트가 manual_implement(외부 세션 코딩 우회)를
+    켜둔 상태라면 그냥 멈추고 사람이 API를 수동 호출하길 기다리지 않는다 —
+    manual_implement가 켜져 있다는 건 이미 "이 프로젝트의 implement는 컨테이너
+    대신 외부 세션이 처리한다"는 명시적 선택이므로, 예산 소진도 같은 경로로
+    묶어서 MANUAL_TASKS_DIR에 태스크 파일만 쓰고(_retry_implement_with_feedback→
+    _send_task_or_manual) 카운터를 리셋해 계속 진행한다. manual_implement가
+    꺼진 프로젝트만 기존처럼 FAILED로 멈추고 사람의 수동 개입(retry-implement
+    API)을 기다린다."""
     label = STAGE_LABELS_KO.get(stage_name, stage_name)
     count = qa_retry_counts.get(project_id, 0)
     feedback = outputs.get("feedback", outputs.get("summary", ""))
@@ -787,6 +839,16 @@ async def _route_needs_rework_or_fail(pipeline: Pipeline, project_id: str, stage
         for story in project_jira.get(project_id, {}).get("stories", []):
             await add_jira_comment(story, f"🔁 {label} 재작업 요청 ({count + 1}/{MAX_QA_RETRIES}): {feedback}")
         await _add_history(project_id, f"🔁 {label} 재작업 요청 ({count + 1}/{MAX_QA_RETRIES}): {feedback}")
+        await _retry_implement_with_feedback(pipeline, feedback)
+    elif project_manual_implement.get(project_id, False):
+        qa_retry_counts[project_id] = 0
+        await broadcast({
+            "type": "agent_message", "project_id": project_id, "agent": "system",
+            "content": f"🖐 {label} 재작업을 {MAX_QA_RETRIES}회 시도했지만 여전히 실패 — 외부 세션(manual-agent-work) 작업 요청으로 전환합니다.\n{feedback}",
+        })
+        for story in project_jira.get(project_id, {}).get("stories", []):
+            await add_jira_comment(story, f"🖐 {label} 재작업 {MAX_QA_RETRIES}회 실패 — 외부 세션 작업 요청으로 전환: {feedback}")
+        await _add_history(project_id, f"🖐 {label} 재작업 {MAX_QA_RETRIES}회 실패 — 외부 세션 작업 요청으로 전환: {feedback}")
         await _retry_implement_with_feedback(pipeline, feedback)
     else:
         pipeline.mark_failed(stage_name, outputs)
@@ -854,6 +916,13 @@ async def _create_ad_hoc_jira_story(project_id: str, title: str) -> str | None:
         "type": "agent_message", "project_id": project_id, "agent": "system",
         "content": f"📋 [Sprint {sprint}] 새 Jira 이슈 생성: {_story_link(project_id, key, 'spec')}",
     })
+    if records[0].get("parent_linked") is False:
+        await broadcast({
+            "type": "agent_message", "project_id": project_id, "agent": "system",
+            "content": (f"⚠️ {key}는 만들어졌지만 Epic({epic})에 연결하지 못했습니다 — "
+                        f"{epic}의 Jira 이슈 타입이 실제 Epic이 아닌 것으로 보입니다. Jira에서 "
+                        f"{epic}의 이슈 타입을 Epic으로 바꾸거나, {key}를 수동으로 연결해주세요."),
+        })
     return key
 
 
@@ -892,11 +961,22 @@ async def _sync_new_requirements_to_epic(project_id: str, pm_text: str) -> list[
         return []
 
     jira["synced_req_ids"] = list(synced_ids)
+    unlinked_keys = []
     for r in records:
         jira.setdefault("stories", []).append(r["key"])
         jira.setdefault("story_titles", {})[r["key"]] = r["title"]
         if r.get("subtasks"):
             jira.setdefault("story_subtasks", {})[r["key"]] = r["subtasks"]
+        if r.get("parent_linked") is False:
+            unlinked_keys.append(r["key"])
+
+    if unlinked_keys:
+        await broadcast({
+            "type": "agent_message", "project_id": project_id, "agent": "system",
+            "content": (f"⚠️ {', '.join(unlinked_keys)}는 만들어졌지만 Epic({epic})에 연결하지 "
+                        f"못했습니다 — {epic}의 Jira 이슈 타입이 실제 Epic이 아닌 것으로 보입니다. "
+                        f"Jira에서 {epic}의 이슈 타입을 Epic으로 바꾸거나 수동으로 연결해주세요."),
+        })
 
     return records
 
@@ -907,10 +987,21 @@ async def _handle_chat_triage_result(pipeline: Pipeline, project_id: str, output
     로직을 중복시키지 않는다(승인 게이트 리셋 등 기존 동작을 그대로 물려받음).
 
     PM이 판단한 target(기존 이슈 key | "new" | None)을 실제 scenario_key로
-    해석한다 — target이 "new"면 새 Jira 이슈를 먼저 만들고, 존재하지 않는 키를
-    가리키면(PM이 잘못 판단했거나 project_jira 상태를 못 봤을 수 있으므로) 안전하게
-    scenario_key=None(전체 재작업)으로 폴백한다. agent.py의 parse_triage_decision은
-    project_jira를 모르기 때문에 이 검증은 여기서만 할 수 있다."""
+    해석한다 — target이 "new"면 새 Jira 이슈를 항상 만든다(new_story_title이
+    비어 있어도 feedback 앞부분으로 제목을 채워서라도 만든다 — 절대 생략하지
+    않는다). "새 요구사항"이라고 판단해놓고 이슈 생성에 실패했다고 조용히
+    전체 재작업(scenario_key=None)으로 폴백하면, 완전히 새로운 화면/기능 요청이
+    관련 없는 기존 화면들을 전부 건드리게 된다(실제로 recoveryfit 앱 아이콘
+    요청에서 이렇게 재현됨 — Jira 생성이 실패하자 design이 unscoped로 돌아
+    ATM-5~12를 전부 다시 만들면서 정작 아이콘 mockup은 어디에도 안 생겼다).
+    그래서 target=="new"인데 이슈 생성 자체가 실패하면 전체 재작업으로 폴백하지
+    않고 아예 재작업을 하지 않는다(사용자에게 실패를 알리고 멈춤). target이
+    기존 이슈 key를 가리키는데 그 키가 project_jira에 없으면(PM이 잘못
+    판단했거나 project_jira 상태를 못 봤을 수 있으므로) 이 경우에만 안전하게
+    scenario_key=None(전체 재작업)으로 폴백한다 — "새 요구사항"과 "기존 이슈를
+    잘못 가리킨 경우"는 폴백 위험이 다르므로 구분한다. agent.py의
+    parse_triage_decision은 project_jira를 모르기 때문에 이 검증은 여기서만
+    할 수 있다."""
     chat_triage_in_flight.pop(project_id, None)
     scope           = outputs.get("scope", "none")
     feedback        = outputs.get("feedback", "")
@@ -919,8 +1010,18 @@ async def _handle_chat_triage_result(pipeline: Pipeline, project_id: str, output
     new_story_title = outputs.get("new_story_title", "")
 
     scenario_key = None
-    if target == "new" and new_story_title:
-        scenario_key = await _create_ad_hoc_jira_story(project_id, new_story_title)
+    if target == "new":
+        title = new_story_title or (feedback[:80] if feedback else "새 요청")
+        scenario_key = await _create_ad_hoc_jira_story(project_id, title)
+        if not scenario_key:
+            await broadcast({
+                "type": "agent_message", "project_id": project_id, "agent": "system",
+                "content": ("❌ 기존 화면/기능과 무관한 새 요구사항으로 판단했지만 Jira에 새 "
+                            "이슈를 만들지 못해 재작업을 진행하지 못했습니다. 관련 없는 기존 "
+                            "화면들을 건드리는 전체 재작업으로는 폴백하지 않습니다 — Jira 연동 "
+                            "상태를 확인한 뒤 다시 요청해주세요."),
+            })
+            return
     elif target and target in project_jira.get(project_id, {}).get("stories", []):
         scenario_key = target
 
@@ -1087,7 +1188,19 @@ _NO_BLIND_REVERT_GUIDANCE = (
     "디자인/동작을 바꾼 거라면(예: 배경색·버튼 종류·레이아웃 변경 커밋이 최근에 있음) "
     "실패 원인은 그 변경을 못 따라간 오래된 테스트 쪽일 가능성이 높습니다 — 그럴 땐 앱 "
     "코드가 아니라 테스트를 최신 동작에 맞게 갱신하세요. 반대로 그런 의도적 변경 이력이 "
-    "없다면 앱 코드 쪽 버그일 가능성이 높습니다."
+    "없다면 앱 코드 쪽 버그일 가능성이 높습니다.\n\n"
+    "그리고 이것도 중요합니다 — QA는 매 라운드 integration_test/scenario_test.dart를 "
+    "LLM으로 처음부터 새로 생성합니다. 그러니 실패 원인이 '최근 의도적 설계 변경을 "
+    "테스트가 못 따라감'도 아니고 '앱이 요구사항을 실제로 안 지킴'도 아니라, 테스트 코드 "
+    "자체의 기술적인 가정 실수인 경우가 있습니다 — 예: 위젯 타입을 잘못 추측(실제론 "
+    "Icon인데 CircleAvatar를 찾는다든지), RichText/Text.rich 안의 TextSpan 조각을 "
+    "find.text()로 정확히 매칭하려 함(RichText는 findRichText: true 없이는 아예 안 "
+    "잡힘), 비동기 초기화 타이밍을 감안 안 한 pump 방식 등. 이런 경우 앱 코드(lib/**)는 "
+    "절대 건드리지 마세요 — 그 라운드의 특정 테스트 문구에 맞춰 앱 위젯 구조를 바꿔봐야 "
+    "다음 QA 라운드가 완전히 다른 테스트를 새로 생성하면 그 변경은 무의미해지고, 오히려 "
+    "불필요한 앱 코드 변경만 쌓입니다. 이 경우엔 integration_test/scenario_test.dart만 "
+    "고치고(다른 시나리오는 건드리지 말 것), `flutter test`/`xvfb-run flutter test`로 "
+    "실제로 통과하는지 반드시 실행해서 확인한 뒤 커밋하세요."
 )
 
 
@@ -1147,6 +1260,7 @@ async def _retry_implement_with_feedback(pipeline: Pipeline, feedback: str, scen
         )
 
     pipeline.mark_running("implement")
+    _clear_phases(pid, ["implement"])
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "implement", "status": "running"})
     await _send_task_or_manual(pipeline, "implement", None, "implement", {
         "project_id": pid,
@@ -1228,6 +1342,7 @@ async def _retry_qa_with_feedback(pipeline: Pipeline, feedback: str):
         instruction += f"\n\n[QA 재실행 요청] {feedback}"
 
     pipeline.mark_running("qa")
+    _clear_phases(pid, ["qa"])
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "qa", "status": "running"})
     await _send_task_or_manual(pipeline, "qa", None, "qa", {
         "project_id": pid, "stage": "qa", "instruction": instruction,
@@ -1250,6 +1365,7 @@ async def _retry_autotest_with_feedback(pipeline: Pipeline, feedback: str):
         instruction += f"\n\n[AutoTest 재실행 요청] {feedback}"
 
     pipeline.mark_running("autotest")
+    _clear_phases(pid, ["autotest"])
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "autotest", "status": "running"})
     await _send_task_or_manual(pipeline, "autotest", None, "autotest", {
         "project_id": pid, "stage": "autotest", "instruction": instruction,
@@ -1272,6 +1388,7 @@ async def _retry_release_with_feedback(pipeline: Pipeline, feedback: str):
         instruction += f"\n\n[Release 재실행 요청] {feedback}"
 
     pipeline.mark_running("release")
+    _clear_phases(pid, ["release"])
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "release", "status": "running"})
     await _send_task_or_manual(pipeline, "release", pid, "release", {
         "project_id": pid, "stage": "release", "instruction": instruction,
@@ -1399,6 +1516,7 @@ async def advance_pipeline(pipeline: Pipeline):
             context["scenarios"] = scenarios
 
         pipeline.mark_running(stage.name)
+        _clear_phases(pipeline.project_id, stage.agents)
         await broadcast({"type": "stage_update", "project_id": pipeline.project_id, "stage": stage.name, "status": "running"})
         await _jira_stage_started(pipeline.project_id, stage.name)
 
@@ -1439,6 +1557,7 @@ def _make_project_info(pid: str) -> dict:
         "name":     project_names.get(pid, pid),
         "repo":     project_repos.get(pid, ""),
         "messages": project_messages.get(pid, []),
+        "phases":   project_phases.get(pid, {}),
         "jira":     project_jira.get(pid, {}),
         "token_totals": {
             "lifetime": _derive_lifetime_totals(pid),
@@ -1994,12 +2113,15 @@ async def get_design_history_file(project_id: str, key: str, version: str):
 async def retry_implement(project_id: str, body: RetryFeedback):
     """qa 자동 재시도(MAX_QA_RETRIES)가 소진돼 FAILED로 멈춘 프로젝트를, 사람이
     직접 확인한 정확한 피드백으로 한 번 더 implement에 재작업 요청할 때 쓰는
-    수동 개입용 엔드포인트. qa_retry_counts는 건드리지 않는다 — 이건 자동
-    루프가 아니라 사람이 원인 파악 후 넣는 수동 트리거이므로."""
+    수동 개입용 엔드포인트. qa_retry_counts를 0으로 리셋한다 — 리셋하지 않으면
+    카운터가 이미 MAX_QA_RETRIES에 도달해 있어서, 이번에 사람이 원인을 고쳐
+    보내도 다음 QA/AutoTest 실패 때 자동 재작업 없이 곧장 다시 FAILED로
+    멈춰버려 매번 수동 개입을 반복해야 했다."""
     p = projects.get(project_id)
     if not p:
         raise HTTPException(404)
-    await _add_history(project_id, f"🔁 QA 재작업 요청 (수동, retry 예산 소진 후 개입): {body.feedback}")
+    qa_retry_counts[project_id] = 0
+    await _add_history(project_id, f"🔁 QA 재작업 요청 (수동, retry 예산 소진 후 개입 — retry 카운트 리셋): {body.feedback}")
     await _retry_implement_with_feedback(p, body.feedback, [body.scenario_key] if body.scenario_key else None)
     return {"ok": True}
 
@@ -2201,12 +2323,20 @@ async def trigger_deploy(project_id: str):
     if not workspace:
         raise HTTPException(400, "host_workspace_path가 설정돼 있지 않습니다 — 배포 카드에서 먼저 설정하세요")
 
-    project_deploy_status[project_id] = {"status": "running", "started_at": int(time.time() * 1000)}
+    project_deploy_status[project_id] = {"status": "running", "started_at": int(time.time() * 1000), "phases": {}}
     _save_project(project_id)
     await broadcast({
         "type": "project_updated", "project_id": project_id,
         "projects": {project_id: _make_project_info(project_id)},
     })
+
+    # host_workspace_path가 아직 clone된 적 없는 빈 디렉토리일 수 있으므로,
+    # deploy_runner가 필요하면 스스로 clone할 수 있게 이 프로젝트의 GitHub 레포
+    # URL을 같이 넘긴다 — clone_existing_repo(프로젝트 생성 시 clone)와 동일하게
+    # GITHUB_TOKEN을 박아 만든다. 연결된 레포가 없거나 토큰이 없으면 None으로
+    # 넘어가고, deploy_runner는 workspace가 이미 clone돼 있지 않으면 그때 에러를 낸다.
+    github_repo = project_repos.get(project_id)
+    repo_url = f"https://{GITHUB_TOKEN}@github.com/{github_repo}.git" if (github_repo and GITHUB_TOKEN) else None
 
     payload = {
         "project_id": project_id,
@@ -2214,7 +2344,10 @@ async def trigger_deploy(project_id: str):
         "environment": cfg.get("environment", "prod"),
         "platforms": cfg.get("platforms", ["ios", "android"]),
         "app_version": cfg.get("app_version"),
+        "app_identifier": cfg.get("app_identifier"),
+        "repo_url": repo_url,
         "callback_url": "http://localhost:8000/internal/deploy-callback",
+        "progress_url": "http://localhost:8000/internal/deploy-progress",
     }
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -2265,6 +2398,7 @@ async def deploy_callback(body: DeployCallback):
         "build_number": body.build_number,
         "log_tail": body.log_tail,
         "error": body.error,
+        "phases": prev.get("phases", {}),  # 단계별 스텝칩은 이 결과가 온 뒤에도 그대로 남겨서 보여준다
     }
     _save_project(project_id)
     await broadcast({
@@ -2273,6 +2407,32 @@ async def deploy_callback(body: DeployCallback):
     })
     label = f"{body.app_version}+{body.build_number}" if body.success else (body.error or "실패")
     await _add_history(project_id, f"{'✅' if body.success else '❌'} 배포 {'완료' if body.success else '실패'}: {label}")
+    return {"ok": True}
+
+
+class DeployProgress(BaseModel):
+    project_id: str
+    phase: str
+    status: str   # start|success|fail
+    label: str
+    detail: str = ""
+
+@app.post("/internal/deploy-progress")
+async def deploy_progress(body: DeployProgress):
+    """deploy_runner.py가 배포 단계(workspace/version/build/fastlane/commit_push)
+    하나를 시작·완료할 때마다 보내는 진행 상황 통보 — 배포 카드의 스텝칩을
+    채운다. deploy-callback과 동일하게 내부 전용, 무인증."""
+    project_id = body.project_id
+    if project_id not in projects:
+        raise HTTPException(404)
+
+    st = project_deploy_status.setdefault(project_id, {"status": "running"})
+    phases = st.setdefault("phases", {})
+    phases[body.phase] = {"status": body.status, "label": body.label, "detail": body.detail}
+    await broadcast({
+        "type": "project_updated", "project_id": project_id,
+        "projects": {project_id: _make_project_info(project_id)},
+    })
     return {"ok": True}
 
 

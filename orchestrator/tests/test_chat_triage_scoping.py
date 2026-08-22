@@ -162,6 +162,68 @@ async def test_target_unknown_key_falls_back_to_unscoped(monkeypatch):
     assert calls == [None]
 
 
+async def test_target_new_with_empty_title_still_creates_story(monkeypatch):
+    """new_story_title을 PM이 깜빡 비워도(모델이 형식을 안 지켰을 때) target=="new"면
+    feedback으로 제목을 채워서라도 새 이슈를 만들어야 한다 — 절대 스코프 없이
+    전체 재작업으로 새는 일이 없어야 한다."""
+    p = _project_with_scenarios("p1")
+    monkeypatch.setattr(main, "project_jira", {
+        "p1": {"epic": "ATM-1", "stories": [], "story_titles": {}},
+    })
+
+    async def _fake_create_jira_stories(epic_key, project_name, requirements):
+        assert epic_key == "ATM-1"
+        return [{"key": "ATM-9", "title": requirements[0]}]
+
+    monkeypatch.setattr(main, "create_jira_stories", _fake_create_jira_stories)
+
+    calls = []
+
+    async def _fake_retry_design(pipeline, feedback, scenario_keys=None):
+        calls.append(scenario_keys)
+
+    monkeypatch.setattr(main, "_retry_design_with_feedback", _fake_retry_design)
+
+    await main._handle_chat_triage_result(p, "p1", {
+        "scope": "design", "target": "new", "new_story_title": "",
+        "feedback": "앱 아이콘도 디자인해서 넣어줘", "reply": "새 이슈로 등록할게요",
+    })
+
+    assert calls == [["ATM-9"]]
+
+
+async def test_target_new_story_creation_failure_does_not_fall_back_to_unscoped(monkeypatch):
+    """target=="new"인데 Jira 이슈 생성 자체가 실패하면(예: epic이 실제로는 Epic
+    타입이 아니라서 등) 관련 없는 기존 화면들을 전부 건드리는 전체 재작업으로
+    조용히 폴백해서는 안 된다 — recoveryfit 앱 아이콘 요청에서 실제로 이렇게
+    재현됐다(이슈 생성 실패 → design이 unscoped로 돌아 ATM-5~12를 전부 다시
+    만들면서 정작 아이콘 mockup은 어디에도 안 생김). 재작업 자체를 하지 않아야
+    한다."""
+    p = _project_with_scenarios("p1")
+    monkeypatch.setattr(main, "project_jira", {
+        "p1": {"epic": "ATM-4", "stories": ["ATM-5"], "story_titles": {"ATM-5": "로그인 화면"}},
+    })
+
+    async def _fake_create_jira_stories(epic_key, project_name, requirements):
+        return []  # Jira가 400을 반환한 상황을 흉내
+
+    monkeypatch.setattr(main, "create_jira_stories", _fake_create_jira_stories)
+
+    calls = []
+
+    async def _fake_retry_design(pipeline, feedback, scenario_keys=None):
+        calls.append(scenario_keys)
+
+    monkeypatch.setattr(main, "_retry_design_with_feedback", _fake_retry_design)
+
+    await main._handle_chat_triage_result(p, "p1", {
+        "scope": "design", "target": "new", "new_story_title": "앱 아이콘 디자인",
+        "feedback": "앱 아이콘도 디자인해서 넣어줘", "reply": "새 이슈로 등록할게요",
+    })
+
+    assert calls == []
+
+
 async def test_no_target_falls_back_to_unscoped(monkeypatch):
     p = _project_with_scenarios("p1")
     monkeypatch.setattr(main, "project_jira", {})
