@@ -317,6 +317,20 @@ def _deploy(job: dict):
         log.append(f"[ERROR] {e}")
         _report_phase(progress_url, project_id, phase, "fail", str(e))
 
+        # 실패한 지점이 workspace/version/build phase 이후라면 app_identifier
+        # 동기화나 pubspec 버전 bump로 워크스페이스가 지저분해져 있을 수 있다
+        # (커밋되지 않은 변경사항이 있으면 다음 배포 시도가 clean-check에서
+        # 곧바로 막힌다) — 실패해도 지금까지의 변경은 최선을 다해 커밋/푸시해서
+        # 다음 시도가 깨끗한 워크스페이스에서 시작하게 한다.
+        pending = subprocess.run(
+            ["git", "-C", workspace, "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if pending:
+            recovery_msg = f"chore: 배포 실패 후 정리 ({phase} phase 실패, {app_version or '?'}+{result.get('build_number') or '?'})"
+            if _run(["git", "-C", workspace, "commit", "-am", recovery_msg], workspace, log):
+                _run(["git", "-C", workspace, "push"], workspace, log)
+
     tail = "\n".join(log)
     result["log_tail"] = tail[-LOG_TAIL_CHARS:]
 
