@@ -2305,6 +2305,7 @@ async def trigger_deploy(project_id: str):
         "environment": cfg.get("environment", "prod"),
         "platforms": cfg.get("platforms", ["ios", "android"]),
         "app_version": cfg.get("app_version"),
+        "app_identifier": cfg.get("app_identifier"),
         "repo_url": repo_url,
         "callback_url": "http://localhost:8000/internal/deploy-callback",
         "progress_url": "http://localhost:8000/internal/deploy-progress",

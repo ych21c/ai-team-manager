@@ -13,7 +13,11 @@ python3로 직접 띄운다:
 
 프로토콜(orchestrator/main.py의 POST /projects/{id}/deploy가 호출):
   POST /run  { project_id, workspace, environment, platforms, app_version,
-               repo_url, callback_url, progress_url }
+               app_identifier, repo_url, callback_url, progress_url }
+
+app_identifier가 오면(배포 설정 카드 입력값) workspace phase에서 iOS
+PRODUCT_BUNDLE_IDENTIFIER / Android applicationId / fastlane Fastfile
+PACKAGE_NAME / Appfile app_identifier를 전부 그 값으로 맞춘다.
   → 202 즉시 응답, 백그라운드 스레드에서 실제 빌드+업로드 수행 후
     callback_url로 최종 결과 POST(progress_url로는 단계별 진행 상황을 그때그때
     POST — 둘 다 실패해도 배포 자체는 계속 진행, 통보만 못 갈 뿐).
@@ -48,6 +52,9 @@ PORT = 8765
 LOG_TAIL_CHARS = 4000
 
 VERSION_RE = re.compile(r"^version:\s*(\S+)\+(\d+)\s*$", re.MULTILINE)
+# 역DNS 앱 식별자 형식만 허용 — 배포 설정 카드에 한글 등 비ASCII 값이 잘못
+# 입력됐을 때 pbxproj/build.gradle.kts를 깨뜨리기 전에 막는다.
+APP_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(\.[A-Za-z][A-Za-z0-9_]*)+$")
 
 LANE_BY_PLATFORMS = {
     frozenset({"ios"}): "upload_ios",
@@ -126,6 +133,73 @@ def _write_app_version(workspace: str, app_version: str, build_number: str, log:
     log.append(f"[INFO] pubspec.yaml version → {app_version}+{build_number}")
 
 
+def _apply_app_identifier(workspace: str, app_identifier: str, log: list[str]):
+    """배포 설정 카드의 App Identifier 입력값을 실제 iOS/Android 프로젝트 +
+    fastlane 설정에 반영한다. 지금까지는 이 필드가 project_deploy_config에만
+    저장되고 아무 데도 쓰이지 않았다 — 그래서 웹에서 값을 바꿔도 실제 빌드에
+    반영되지 않는 게 버그로 보고됐다."""
+    if not APP_IDENTIFIER_RE.match(app_identifier):
+        raise RuntimeError(
+            f"app_identifier '{app_identifier}'가 올바른 형식이 아닙니다 — "
+            "영문/숫자/점만 쓰는 역DNS 형식(예: com.example.app)이어야 합니다."
+        )
+
+    pbxproj_path = os.path.join(workspace, "ios/Runner.xcodeproj/project.pbxproj")
+    if os.path.isfile(pbxproj_path):
+        with open(pbxproj_path) as f:
+            pbxproj = f.read()
+        main_ids = {
+            m for m in re.findall(r"PRODUCT_BUNDLE_IDENTIFIER = ([^;]+);", pbxproj)
+            if not m.endswith(".RunnerTests")
+        }
+        if len(main_ids) == 1:
+            current = next(iter(main_ids))
+            if current != app_identifier:
+                new_pbxproj = pbxproj.replace(
+                    f"PRODUCT_BUNDLE_IDENTIFIER = {current};",
+                    f"PRODUCT_BUNDLE_IDENTIFIER = {app_identifier};",
+                ).replace(
+                    f"PRODUCT_BUNDLE_IDENTIFIER = {current}.RunnerTests;",
+                    f"PRODUCT_BUNDLE_IDENTIFIER = {app_identifier}.RunnerTests;",
+                )
+                with open(pbxproj_path, "w") as f:
+                    f.write(new_pbxproj)
+                log.append(f"[INFO] iOS PRODUCT_BUNDLE_IDENTIFIER: {current} → {app_identifier}")
+        elif main_ids:
+            log.append(f"[WARN] iOS bundle id를 여러 개 발견({sorted(main_ids)}) — 자동 변경을 건너뜁니다")
+
+    gradle_path = os.path.join(workspace, "android/app/build.gradle.kts")
+    if os.path.isfile(gradle_path):
+        with open(gradle_path) as f:
+            gradle = f.read()
+        m = re.search(r'applicationId\s*=\s*"([^"]+)"', gradle)
+        if m and m.group(1) != app_identifier:
+            new_gradle = gradle[:m.start(1)] + app_identifier + gradle[m.end(1):]
+            with open(gradle_path, "w") as f:
+                f.write(new_gradle)
+            log.append(f"[INFO] Android applicationId: {m.group(1)} → {app_identifier}")
+
+    fastfile_path = os.path.join(workspace, "fastlane/Fastfile")
+    if os.path.isfile(fastfile_path):
+        with open(fastfile_path) as f:
+            fastfile = f.read()
+        new_fastfile, n = re.subn(r'PACKAGE_NAME = "[^"]+"', f'PACKAGE_NAME = "{app_identifier}"', fastfile, count=1)
+        if n and new_fastfile != fastfile:
+            with open(fastfile_path, "w") as f:
+                f.write(new_fastfile)
+            log.append(f"[INFO] fastlane Fastfile PACKAGE_NAME → {app_identifier}")
+
+    appfile_path = os.path.join(workspace, "fastlane/Appfile")
+    if os.path.isfile(appfile_path):
+        with open(appfile_path) as f:
+            appfile = f.read()
+        new_appfile, n = re.subn(r'app_identifier "[^"]+"', f'app_identifier "{app_identifier}"', appfile, count=1)
+        if n and new_appfile != appfile:
+            with open(appfile_path, "w") as f:
+                f.write(new_appfile)
+            log.append(f"[INFO] fastlane Appfile app_identifier → {app_identifier}")
+
+
 def _clone(workspace: str, repo_url: str, log: list[str]) -> bool:
     parent = os.path.dirname(workspace.rstrip("/")) or "."
     os.makedirs(parent, exist_ok=True)
@@ -159,6 +233,7 @@ def _deploy(job: dict):
     environment  = job.get("environment") or "prod"
     platforms    = job.get("platforms") or ["ios", "android"]
     app_version  = job.get("app_version")
+    app_identifier = job.get("app_identifier")
     repo_url     = job.get("repo_url")
     callback_url = job["callback_url"]
     progress_url = job.get("progress_url")
@@ -186,6 +261,10 @@ def _deploy(job: dict):
             raise RuntimeError("git checkout main 실패")
         if not _run(["git", "-C", workspace, "pull", "--ff-only"], workspace, log):
             raise RuntimeError("git pull 실패")
+
+        if app_identifier:
+            _apply_app_identifier(workspace, app_identifier, log)
+
         _report_phase(progress_url, project_id, "workspace", "success")
 
         phase = "version"
