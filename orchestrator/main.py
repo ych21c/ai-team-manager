@@ -987,10 +987,21 @@ async def _handle_chat_triage_result(pipeline: Pipeline, project_id: str, output
     로직을 중복시키지 않는다(승인 게이트 리셋 등 기존 동작을 그대로 물려받음).
 
     PM이 판단한 target(기존 이슈 key | "new" | None)을 실제 scenario_key로
-    해석한다 — target이 "new"면 새 Jira 이슈를 먼저 만들고, 존재하지 않는 키를
-    가리키면(PM이 잘못 판단했거나 project_jira 상태를 못 봤을 수 있으므로) 안전하게
-    scenario_key=None(전체 재작업)으로 폴백한다. agent.py의 parse_triage_decision은
-    project_jira를 모르기 때문에 이 검증은 여기서만 할 수 있다."""
+    해석한다 — target이 "new"면 새 Jira 이슈를 항상 만든다(new_story_title이
+    비어 있어도 feedback 앞부분으로 제목을 채워서라도 만든다 — 절대 생략하지
+    않는다). "새 요구사항"이라고 판단해놓고 이슈 생성에 실패했다고 조용히
+    전체 재작업(scenario_key=None)으로 폴백하면, 완전히 새로운 화면/기능 요청이
+    관련 없는 기존 화면들을 전부 건드리게 된다(실제로 recoveryfit 앱 아이콘
+    요청에서 이렇게 재현됨 — Jira 생성이 실패하자 design이 unscoped로 돌아
+    ATM-5~12를 전부 다시 만들면서 정작 아이콘 mockup은 어디에도 안 생겼다).
+    그래서 target=="new"인데 이슈 생성 자체가 실패하면 전체 재작업으로 폴백하지
+    않고 아예 재작업을 하지 않는다(사용자에게 실패를 알리고 멈춤). target이
+    기존 이슈 key를 가리키는데 그 키가 project_jira에 없으면(PM이 잘못
+    판단했거나 project_jira 상태를 못 봤을 수 있으므로) 이 경우에만 안전하게
+    scenario_key=None(전체 재작업)으로 폴백한다 — "새 요구사항"과 "기존 이슈를
+    잘못 가리킨 경우"는 폴백 위험이 다르므로 구분한다. agent.py의
+    parse_triage_decision은 project_jira를 모르기 때문에 이 검증은 여기서만
+    할 수 있다."""
     chat_triage_in_flight.pop(project_id, None)
     scope           = outputs.get("scope", "none")
     feedback        = outputs.get("feedback", "")
@@ -999,8 +1010,18 @@ async def _handle_chat_triage_result(pipeline: Pipeline, project_id: str, output
     new_story_title = outputs.get("new_story_title", "")
 
     scenario_key = None
-    if target == "new" and new_story_title:
-        scenario_key = await _create_ad_hoc_jira_story(project_id, new_story_title)
+    if target == "new":
+        title = new_story_title or (feedback[:80] if feedback else "새 요청")
+        scenario_key = await _create_ad_hoc_jira_story(project_id, title)
+        if not scenario_key:
+            await broadcast({
+                "type": "agent_message", "project_id": project_id, "agent": "system",
+                "content": ("❌ 기존 화면/기능과 무관한 새 요구사항으로 판단했지만 Jira에 새 "
+                            "이슈를 만들지 못해 재작업을 진행하지 못했습니다. 관련 없는 기존 "
+                            "화면들을 건드리는 전체 재작업으로는 폴백하지 않습니다 — Jira 연동 "
+                            "상태를 확인한 뒤 다시 요청해주세요."),
+            })
+            return
     elif target and target in project_jira.get(project_id, {}).get("stories", []):
         scenario_key = target
 
