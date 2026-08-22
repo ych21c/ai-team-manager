@@ -29,7 +29,7 @@ from openhands.tools.task_tracker import TaskTrackerTool
 from openhands.tools.terminal import TerminalTool
 
 from build_apk import build_and_handoff_apk, _extract_issue_lines, _has_analyze_errors
-from git_workspace import run, ensure_git_workspace
+from git_workspace import run, ensure_git_workspace, find_conflict_marker_files
 from prompt_helpers import mockup_guidance, NO_EMULATOR_GUIDANCE
 
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -193,7 +193,10 @@ def run_openhands_task(workspace: str, instruction: str, project_id: str, is_ret
             f"실제로 빌드되는 것까지 확인하고, 실패하면 그 자리에서 고치세요. "
             f"{NO_EMULATOR_GUIDANCE} "
             f"작업을 완료했으면 변경사항을 정리하고 멈추세요. "
-            f"git commit/push는 직접 하지 마세요 (다른 프로세스가 처리합니다)."
+            f"git commit/push는 직접 하지 마세요 (다른 프로세스가 처리합니다). "
+            f"git merge/pull/rebase/cherry-pick도 직접 실행하지 마세요 — 브랜치는 "
+            f"이미 최신 상태로 준비되어 있고, 실제로 충돌이 나면 그 컨플릭트 마커가 "
+            f"그대로 커밋돼 CI가 깨지는 사고가 있었습니다."
         )
         conversation.run()
 
@@ -333,6 +336,19 @@ async def process_task(r: aioredis.Redis, task: dict):
     else:
         await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
                         "content": f"⚠️ 자체 빌드 검증 실패 — QA가 자체 빌드로 폴백해서 검증합니다: {build_detail[:300]}"})
+
+    conflict_files = find_conflict_marker_files(workspace, diff.stdout)
+    if conflict_files:
+        # 실제 진행 중인 merge가 있었다면 워크스페이스를 깨끗하게 되돌려서
+        # 다음 재시도가 이 라운드의 반쯤 풀린 merge 상태를 이어받지 않게 한다
+        # (실패해도 무시 — merge 중이 아니었을 수도 있음).
+        run(["git", "merge", "--abort"], cwd=workspace)
+        await emit(r, {"type": "message", "project_id": project_id, "agent": AGENT_NAME,
+                        "content": f"❌ 커밋 전 git 컨플릭트 마커 발견 — 커밋을 막았습니다: {', '.join(conflict_files[:10])}"})
+        await emit(r, {"type": "stage_failed", "project_id": project_id, "agent": AGENT_NAME,
+                        "stage": stage,
+                        "error": f"OpenHands가 남긴 것으로 보이는 git 컨플릭트 마커가 있어 커밋/PR을 중단했습니다: {', '.join(conflict_files)}"})
+        return
 
     run(["git", "add", "-A"], cwd=workspace)
     run(["git", "commit", "-m", f"AI Implement: {instruction[:60]}"], cwd=workspace)

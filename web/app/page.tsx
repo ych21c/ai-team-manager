@@ -7,9 +7,16 @@ import { canDiscardStage, canCancelStage, agentSubStatus } from "./flowchartRule
 
 // ── 타입 ──────────────────────────────────────────────────────────
 type AgentStatus = "pending" | "running" | "completed" | "failed" | "waiting_approval";
+type PhaseStatus = "start" | "success" | "fail" | "skip";
+interface PhaseEntry { label: string; status: PhaseStatus; detail: string; ts: number; }
 
 interface AgentState {
   name: string; label: string; status: AgentStatus; progress: number; lastMessage: string;
+  // 에이전트 하나가 실제로 거치는 세부 작업 단위(빌드 시작/성공, 테스트 코드
+  // 자체 수정, 실기기 테스트 제출/대기 등)를 phase id로 키를 준 고정 항목으로
+  // 쌓아둔다 — agent_message처럼 스크롤에 묻히는 대신, 같은 phase id가 다시
+  // 오면 그 자리에서 상태 마커(⏳/✅/❌)만 갱신된다.
+  phases: Record<string, PhaseEntry>;
 }
 interface StageOutputs {
   summary?: string; branch?: string; pr_number?: number; pr_url?: string;
@@ -43,6 +50,9 @@ interface DeployStatus {
   status: "idle" | "running" | "success" | "failed";
   started_at?: number; finished_at?: number;
   app_version?: string; build_number?: string; log_tail?: string; error?: string;
+  // scripts/deploy_runner.py가 단계(workspace/version/build/fastlane/commit_push)마다
+  // POST /internal/deploy-progress로 보내는 걸 그대로 쌓은 것 — DEPLOY_PHASE_ORDER 참고.
+  phases?: Record<string, { status: PhaseStatus; label: string; detail?: string }>;
 }
 interface Project {
   id: string; name: string; repo?: string;
@@ -193,23 +203,32 @@ function ProjectLinksMenu({ project, variant = "header" }: { project?: Project; 
 }
 
 const INITIAL_AGENTS = (): AgentState[] => [
-  { name: "pm",        label: "PM",        status: "pending", progress: 0, lastMessage: "" },
-  { name: "designer",  label: "Designer",  status: "pending", progress: 0, lastMessage: "" },
-  { name: "architect", label: "Architect", status: "pending", progress: 0, lastMessage: "" },
-  { name: "implement", label: "Implement", status: "pending", progress: 0, lastMessage: "" },
-  { name: "qa",        label: "QA",        status: "pending", progress: 0, lastMessage: "" },
-  { name: "autotest",  label: "AutoTest",  status: "pending", progress: 0, lastMessage: "" },
-  { name: "release",   label: "Release",   status: "pending", progress: 0, lastMessage: "" },
+  { name: "pm",        label: "PM",        status: "pending", progress: 0, lastMessage: "", phases: {} },
+  { name: "designer",  label: "Designer",  status: "pending", progress: 0, lastMessage: "", phases: {} },
+  { name: "architect", label: "Architect", status: "pending", progress: 0, lastMessage: "", phases: {} },
+  { name: "implement", label: "Implement", status: "pending", progress: 0, lastMessage: "", phases: {} },
+  { name: "qa",        label: "QA",        status: "pending", progress: 0, lastMessage: "", phases: {} },
+  { name: "autotest",  label: "AutoTest",  status: "pending", progress: 0, lastMessage: "", phases: {} },
+  { name: "release",   label: "Release",   status: "pending", progress: 0, lastMessage: "", phases: {} },
 ];
 
 // 새로고침/재접속 직후엔 agentMap이 INITIAL_AGENTS()로 비어 있어서, 실제로는
 // implement가 한창 실행 중이어도 다음 agent_message가 올 때까지 화면엔 "지금
 // 뭐 하는지"가 안 보이는 공백이 있었다 — 서버가 이미 복원해서 보내주는 채팅
 // 이력(messages)에서 에이전트별 마지막 발언을 찾아 lastMessage를 미리 채운다.
-const seedAgentsFromMessages = (messages?: Message[]): AgentState[] => {
+// phases도 같은 이유로 비어있으면 QA 카드의 단계 칩이 새로고침할 때마다 사라지는
+// 문제가 있었다 — 서버가 project_phases(orchestrator/main.py)로 들고 있다가
+// _make_project_info에 실어 보내주는 최신 칩 상태로 미리 채운다.
+const seedAgentsFromMessages = (
+  messages?: Message[],
+  phases?: Record<string, Record<string, PhaseEntry>>,
+): AgentState[] => {
   const byName = Object.fromEntries(INITIAL_AGENTS().map(a => [a.name, a])) as Record<string, AgentState>;
   (messages ?? []).forEach(m => {
     if (byName[m.from]) byName[m.from] = { ...byName[m.from], lastMessage: m.content.slice(0, 80) };
+  });
+  Object.entries(phases ?? {}).forEach(([agentName, agentPhases]) => {
+    if (byName[agentName]) byName[agentName] = { ...byName[agentName], phases: agentPhases };
   });
   return Object.values(byName);
 };
@@ -265,6 +284,116 @@ function LiveStep({ agent }: { agent?: AgentState }) {
     }}>
       {isRunning && <span style={{ width: 6, height: 6, borderRadius: "50%", background: "#E8A93D", flexShrink: 0 }} />}
       <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agent.lastMessage}</span>
+    </div>
+  );
+}
+
+const PHASE_MARKER: Record<PhaseStatus, [string, string]> = {
+  // [아이콘, 색상] — start는 아직 진행 중이라 스피너를 얹어 구분한다.
+  start:   ["⏳", "#854F0B"],
+  success: ["✅", "#3B6D11"],
+  fail:    ["❌", "#A32D2D"],
+  skip:    ["➖", "#888"],
+};
+const PHASE_CHIP_BG: Record<PhaseStatus, string> = {
+  start: "#FFF6E9", success: "#F1F8EA", fail: "#FCEBEB", skip: "#f5f4f0",
+};
+const PHASE_CHIP_BORDER: Record<PhaseStatus, string> = {
+  start: "#F0DCAE", success: "#D3E7BD", fail: "#F0C6C6", skip: "#e5e5e5",
+};
+
+// QA 에이전트는 항상 이 순서로 phase를 emit한다(agents/qa_testlab/run.py의
+// QA_PHASES와 동일) — 칩을 정렬하고 "지금 몇 단계째인지"를 계산하는 데만 쓴다.
+// 실제로 존재하지 않는 phase(예: scenario_fix — 자체 수정이 필요했을 때만 나옴)는
+// 이번 라운드에 안 왔으면 칩 자체를 만들지 않는다(가짜 "대기 중" 칩을 만들지 않음).
+const QA_PHASE_ORDER = [
+  "workspace_setup", "scenario_generate", "scenario_fix", "scenario_verify",
+  "device_verify", "build_apk", "robo_test", "result_download", "design_qa", "finalize",
+];
+
+// scripts/deploy_runner.py의 PHASE_LABELS와 같은 순서/id로 맞춰야 한다 —
+// 배포 카드의 스텝칩(DeployStepChips)이 이 순서로 그린다.
+const DEPLOY_PHASE_ORDER = ["workspace", "version", "build", "fastlane", "commit_push"];
+
+// LiveStep(마지막 한 줄, 지나가는 즉시 다음 걸로 덮어써짐)과 달리, 이 에이전트가
+// 이번 라운드에 실제로 거친 작업 단위(빌드 시작→성공, 컴파일 자체 수정, 실기기
+// 테스트 제출/대기 등)를 phase id별로 칩 하나씩 쌓아 보여준다 — "지금 뭘 하고
+// 있고 그 전엔 뭘 했는지, 몇 단계째인지"를 스크롤 없이 한눈에 구분할 수 있게.
+// 같은 phase가 다시 오면(예: start → success) 새 칩을 추가하지 않고 그 칩의
+// 마커만 바뀐다. 칩을 누르면 그 단계의 전체 detail을 아래 패널에 펼쳐 보여준다
+// (기존엔 한 줄로 잘려서 ...으로 가려지던 내용) — 새 라운드가 시작돼 phases가
+// 통째로 비워지면(위 stage_update 핸들러) 펼쳐둔 칩도 같이 접힌다.
+function PhaseTimeline({ agent }: { agent?: AgentState }) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const phases = agent?.phases ?? {};
+  const entries = Object.entries(phases);
+
+  useEffect(() => {
+    if (selected && !phases[selected]) setSelected(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phases]);
+
+  if (entries.length === 0) return null;
+
+  const order = agent?.name === "qa" ? QA_PHASE_ORDER : null;
+  const sorted = order
+    ? [...entries].sort(([a], [b]) => order.indexOf(a) - order.indexOf(b))
+    : entries;
+  const latestStep = order
+    ? Math.max(...sorted.map(([id]) => order.indexOf(id)).filter(i => i >= 0))
+    : -1;
+
+  const active = selected ? phases[selected] : undefined;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
+        {sorted.map(([phase, p]) => {
+          const isSel = selected === phase;
+          const color = PHASE_MARKER[p.status]?.[1] ?? "#888";
+          return (
+            <button key={phase} onClick={() => setSelected(isSel ? null : phase)}
+              title={p.detail || p.label}
+              style={{
+                display: "inline-flex", alignItems: "center", gap: 4,
+                fontSize: 10.5, lineHeight: 1, padding: "4px 9px", borderRadius: 99,
+                background: PHASE_CHIP_BG[p.status] ?? "#f5f4f0",
+                border: `1px solid ${isSel ? color : (PHASE_CHIP_BORDER[p.status] ?? "#e5e5e5")}`,
+                boxShadow: isSel ? `0 0 0 2px ${color}22` : "none",
+                color, fontWeight: isSel || p.status === "start" ? 600 : 500,
+                cursor: "pointer", whiteSpace: "nowrap",
+              }}>
+              {p.status === "start"
+                ? <span style={{
+                    display: "inline-block", width: 7, height: 7, borderRadius: "50%",
+                    border: "1.5px solid #E8A93D", borderTopColor: "transparent",
+                    animation: "spin 0.8s linear infinite", flexShrink: 0,
+                  }} />
+                : <span style={{ flexShrink: 0 }}>{PHASE_MARKER[p.status]?.[0] ?? "•"}</span>}
+              {p.label}
+            </button>
+          );
+        })}
+        {order && latestStep >= 0 && (
+          <span style={{ fontSize: 10, color: "#aaa", marginLeft: 2 }}>{latestStep + 1}/{order.length}단계</span>
+        )}
+      </div>
+
+      {active && (
+        <div style={{
+          fontSize: 11, lineHeight: 1.55, background: "#fafaf7", border: "0.5px solid #ececec",
+          borderRadius: 6, padding: "8px 10px", whiteSpace: "pre-wrap", wordBreak: "break-word",
+          maxHeight: 220, overflowY: "auto",
+        }}>
+          <div style={{ fontWeight: 600, marginBottom: 4, color: PHASE_MARKER[active.status]?.[1] ?? "#888" }}>
+            {PHASE_MARKER[active.status]?.[0] ?? "•"} {active.label}
+          </div>
+          {active.detail
+            ? active.detail
+            : <span style={{ color: "#aaa" }}>세부 내용 없음</span>}
+        </div>
+      )}
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   );
 }
@@ -372,6 +501,9 @@ function DetailPanel({ open, onClose, agents, projectId }: {
                         </button>
                       </div>
                     </div>
+                    {Object.keys(agent.phases).length > 0 && (
+                      <div style={{ marginTop: 4 }}><PhaseTimeline agent={agent} /></div>
+                    )}
                     {agent.lastMessage && <div style={{ fontSize: 11, color: "#888", marginTop: 4, lineHeight: 1.5 }}>{agent.lastMessage}</div>}
                   </div>
                 );
@@ -768,6 +900,10 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
   agentByName: Record<string, AgentState>;
 }) {
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
+  // 원시 로그(AgentLogView, 다른 프로젝트 로그가 섞일 수 있는 공유 컨테이너
+  // 로그 파일 tail)는 기본으로 숨겨둔다 — 진행 상황은 위 PhaseTimeline 칩만으로
+  // 충분히 보이고, 필요할 때만("전체 로그 보기") 펼쳐서 원본을 확인하게 한다.
+  const [showRawLog, setShowRawLog] = useState(false);
   const scopable = name === "design" || name === "implement";
   const meta = STAGE_META[name];
   const agentMeta = AGENT_META[meta.agents[0]] ?? { label: meta.label, color: "#666", bg: "#f0f0f0" };
@@ -878,6 +1014,7 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
                       </div>
                     )}
                     <div style={{ marginTop: 4, display: "flex", flexDirection: "column", gap: 4 }}>
+                      <PhaseTimeline agent={agentByName[a]} />
                       <LiveStep agent={agentByName[a]} />
                       <TaskDetail task={stageInfo?.current_task?.[a]} />
                     </div>
@@ -892,6 +1029,7 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
                   {String(outputs.summary).slice(0, 2000)}
                 </div>
               )}
+              <PhaseTimeline agent={agentByName[meta.agents[0]]} />
               <LiveStep agent={agentByName[meta.agents[0]]} />
               <TaskDetail task={stageInfo?.current_task?.[meta.agents[0]]} />
             </>
@@ -915,7 +1053,15 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
           )}
           {status === "running" && (
             <>
-              {meta.agents.length > 1 ? (
+              <button onClick={() => setShowRawLog(v => !v)}
+                style={{
+                  fontSize: 10.5, padding: "3px 8px", borderRadius: 5, alignSelf: "flex-start",
+                  border: "0.5px solid #d5d5d5", background: showRawLog ? "#EEEDFE" : "#fff",
+                  color: "#7F77DD", cursor: "pointer",
+                }}>
+                {showRawLog ? "▴ 전체 로그 접기" : "▾ 전체 로그 보기"}
+              </button>
+              {showRawLog && (meta.agents.length > 1 ? (
                 // design처럼 에이전트 여럿(designer+architect)이 한 스테이지를 나눠 맡을
                 // 때 예전엔 meta.agents[0]만 보여줘서 architect 로그를 볼 방법이 아예
                 // 없었다 — 에이전트별로 각자 로그를 따로 보여준다.
@@ -926,7 +1072,7 @@ function FlowNode({ name, stageInfo, projectId, isActive, expanded, onToggleExpa
                 </div>
               ) : (
                 <AgentLogView projectId={projectId} agent={meta.agents[0]} live />
-              )}
+              ))}
               {/* 에이전트가 여럿인 스테이지(design)는 위 per-agent 카드에 각자 취소
                   버튼이 있으니 여기서 또 스테이지 전체용 버튼을 안 보여준다 —
                   "이건 뭘 취소하는 거지" 하는 혼란을 피하기 위함. */}
@@ -1127,6 +1273,77 @@ const DEPLOY_FIELDS: { key: keyof DeployConfig; label: string; placeholder: stri
   { key: "host_workspace_path", label: "호스트 워크스페이스 경로", placeholder: "예: /Volumes/External/Dev/Development/child-care-medication" },
 ];
 
+// 배포 진행 단계(workspace clone/checkout → version → flutter build → fastlane
+// → commit/push) 스텝칩 — PhaseTimeline과 같은 마커·배경색 규칙을 그대로 쓰되,
+// 대상이 AgentState가 아니라 DeployStatus.phases라 별도 컴포넌트로 뺐다.
+function DeployStepChips({ phases }: { phases?: DeployStatus["phases"] }) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const entries = Object.entries(phases ?? {});
+
+  useEffect(() => {
+    if (selected && !phases?.[selected]) setSelected(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phases]);
+
+  if (entries.length === 0) return null;
+
+  const sorted = [...entries].sort(([a], [b]) => DEPLOY_PHASE_ORDER.indexOf(a) - DEPLOY_PHASE_ORDER.indexOf(b));
+  const latestStep = Math.max(...sorted.map(([id]) => DEPLOY_PHASE_ORDER.indexOf(id)).filter(i => i >= 0));
+  const active = selected ? phases?.[selected] : undefined;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 12 }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
+        {sorted.map(([phase, p]) => {
+          const isSel = selected === phase;
+          const color = PHASE_MARKER[p.status]?.[1] ?? "#888";
+          return (
+            <button key={phase} onClick={() => setSelected(isSel ? null : phase)}
+              title={p.detail || p.label}
+              style={{
+                display: "inline-flex", alignItems: "center", gap: 4,
+                fontSize: 10.5, lineHeight: 1, padding: "4px 9px", borderRadius: 99,
+                background: PHASE_CHIP_BG[p.status] ?? "#f5f4f0",
+                border: `1px solid ${isSel ? color : (PHASE_CHIP_BORDER[p.status] ?? "#e5e5e5")}`,
+                boxShadow: isSel ? `0 0 0 2px ${color}22` : "none",
+                color, fontWeight: isSel || p.status === "start" ? 600 : 500,
+                cursor: "pointer", whiteSpace: "nowrap",
+              }}>
+              {p.status === "start"
+                ? <span style={{
+                    display: "inline-block", width: 7, height: 7, borderRadius: "50%",
+                    border: "1.5px solid #E8A93D", borderTopColor: "transparent",
+                    animation: "spin 0.8s linear infinite", flexShrink: 0,
+                  }} />
+                : <span style={{ flexShrink: 0 }}>{PHASE_MARKER[p.status]?.[0] ?? "•"}</span>}
+              {p.label}
+            </button>
+          );
+        })}
+        {latestStep >= 0 && (
+          <span style={{ fontSize: 10, color: "#aaa", marginLeft: 2 }}>{latestStep + 1}/{DEPLOY_PHASE_ORDER.length}단계</span>
+        )}
+      </div>
+
+      {active && (
+        <div style={{
+          fontSize: 11, lineHeight: 1.55, background: "#fafaf7", border: "0.5px solid #ececec",
+          borderRadius: 6, padding: "8px 10px", whiteSpace: "pre-wrap", wordBreak: "break-word",
+          maxHeight: 220, overflowY: "auto",
+        }}>
+          <div style={{ fontWeight: 600, marginBottom: 4, color: PHASE_MARKER[active.status]?.[1] ?? "#888" }}>
+            {PHASE_MARKER[active.status]?.[0] ?? "•"} {active.label}
+          </div>
+          {active.detail
+            ? active.detail
+            : <span style={{ color: "#aaa" }}>세부 내용 없음</span>}
+        </div>
+      )}
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
+
 function DeployPanel({ projectId, config, status, releaseCompleted }: {
   projectId: string; config: DeployConfig | undefined; status: DeployStatus | undefined; releaseCompleted: boolean;
 }) {
@@ -1257,6 +1474,8 @@ function DeployPanel({ projectId, config, status, releaseCompleted }: {
           </div>
         )}
       </div>
+
+      <DeployStepChips phases={st.phases} />
 
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <button onClick={triggerDeploy} disabled={disabled || busy}
@@ -1623,7 +1842,7 @@ export default function Home() {
     const pid  = event.project_id as string;
 
     if (type === "init") {
-      const raw = event.projects as Record<string, Project & { messages?: Message[] }>;
+      const raw = event.projects as Record<string, Project & { messages?: Message[]; phases?: Record<string, Record<string, PhaseEntry>> }>;
       if (raw) {
         // 필드를 하나하나 골라 담다가 새 필드(manual_implement, token_totals 등)를
         // 추가할 때마다 여기 안 넣으면 서버가 값을 내려줘도 화면엔 영원히 반영이
@@ -1640,7 +1859,7 @@ export default function Home() {
         // 서버가 들고 있는 채팅 이력으로 복원 (새로고침으로 WS가 재연결돼도
         // 대화가 안 사라지게) — 서버 쪽에 기록이 없으면 기존 로컬 상태 유지.
         setMsgMap(prev => Object.fromEntries(ids.map(id => [id, raw[id]?.messages ?? prev[id] ?? []])));
-        setAgentMap(prev => Object.fromEntries(ids.map(id => [id, prev[id] ?? seedAgentsFromMessages(raw[id]?.messages)])));
+        setAgentMap(prev => Object.fromEntries(ids.map(id => [id, prev[id] ?? seedAgentsFromMessages(raw[id]?.messages, raw[id]?.phases)])));
       }
     }
 
@@ -1708,7 +1927,11 @@ export default function Home() {
       setAgentMap(prev => ({
         ...prev,
         [pid]: (prev[pid] ?? INITIAL_AGENTS()).map(a =>
-          affected.includes(a.name) ? { ...a, status, progress: status === "completed" ? 100 : 10 } : a
+          affected.includes(a.name)
+            // 새 라운드가 시작되면(running) 지난 라운드의 단계 마커를 지운다 —
+            // 안 그러면 재시도 때 이전 라운드의 ✅/❌가 그대로 남아 헷갈린다.
+            ? { ...a, status, progress: status === "completed" ? 100 : 10, phases: status === "running" ? {} : a.phases }
+            : a
         ),
       }));
       setProjects(prev => prev.map(p => p.id !== pid ? p : {
@@ -1730,6 +1953,19 @@ export default function Home() {
         ...prev,
         [pid]: (prev[pid] ?? INITIAL_AGENTS()).map(a =>
           a.name === event.agent ? { ...a, progress: event.progress as number, lastMessage: (event.message as string).slice(0, 80) } : a
+        ),
+      }));
+    }
+
+    else if (type === "agent_phase") {
+      const phase = event.phase as string;
+      setAgentMap(prev => ({
+        ...prev,
+        [pid]: (prev[pid] ?? INITIAL_AGENTS()).map(a =>
+          a.name === event.agent ? { ...a, phases: { ...a.phases, [phase]: {
+            label: event.label as string, status: event.status as PhaseStatus,
+            detail: (event.detail as string) ?? "", ts: Date.now(),
+          } } } : a
         ),
       }));
     }

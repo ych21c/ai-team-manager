@@ -82,6 +82,15 @@ project_jira:   dict[str, dict]    = {}   # project_id → { epic, stories, conf
 project_docs:   dict[str, dict]    = {}   # project_id → { overview, architecture, history:[...], confluence_page_id }
 project_messages: dict[str, list[dict]] = {}   # project_id → 채팅 메시지 이력 (새로고침 시 복원용)
 MAX_STORED_MESSAGES = 300   # 프로젝트당 메모리 상한
+# project_id → agent → phase_id → {label, status, detail, ts} — web/app/page.tsx
+# PhaseTimeline이 그리는 단계별 칩의 서버 쪽 사본. agent_phase 이벤트는 원래
+# 연결된 WS 클라이언트에게만 방송되고 어디에도 저장되지 않아서, 새로고침하거나
+# 탭을 새로 열면(WS는 재연결돼도) 그 세션이 연결되기 전에 지나간 단계들은
+# 영영 복원이 안 돼 QA 카드에 칩이 하나도 안 보이는 문제가 있었다(lastMessage는
+# project_messages로 이미 복원되는데 phases만 빠져있었음). 여기 저장해뒀다가
+# _make_project_info로 내려주면 프론트가 최초 로드 때 seedAgentsFromMessages와
+# 같은 방식으로 칩을 복원한다.
+project_phases: dict[str, dict[str, dict[str, dict]]] = {}
 # project_id → {"by_sprint": {"1": {"planning": {input_tokens,output_tokens,cost_usd}, "design": {...}, ...}, "2": {...}},
 #               "pre_migration": {input_tokens,output_tokens,cost_usd} | None}
 # 스프린트(전체 재기획 회차) × 스테이지 단위로 누적한다 — outputs["input_tokens"/
@@ -199,6 +208,17 @@ def _store_message(project_id: str, frm: str, content: str):
     if len(lst) > MAX_STORED_MESSAGES:
         del lst[: len(lst) - MAX_STORED_MESSAGES]
     _append_chat_log(project_id, msg)
+
+
+def _clear_phases(pid: str, agent_names: list[str]):
+    """새 라운드가 시작될 때(stage_update running) 지난 라운드 칩을 지운다 —
+    web/app/page.tsx의 agent_phase 핸들러(같은 이름의 로직)와 타이밍을 맞춰야,
+    새로고침 직후 복원되는 칩이 이전 라운드 것과 섞이지 않는다."""
+    phases = project_phases.get(pid)
+    if not phases:
+        return
+    for name in agent_names:
+        phases.pop(name, None)
 
 
 def _save_project(pid: str):
@@ -635,6 +655,29 @@ async def handle_agent_event(event: dict):
             "agent": agent_name,
             "progress": event.get("progress", 0),
             "message": event.get("message", ""),
+        })
+    elif event_type == "agent_phase":
+        # QA(그리고 향후 다른 에이전트)가 "빌드 시작/성공, 코드 자체 수정,
+        # 실기기 테스트 제출/대기" 같은 세부 작업 단위를 그대로 브라우저에
+        # 넘긴다 — 웹은 이걸 스크롤되는 채팅이 아니라 에이전트 카드에 고정된
+        # 단계별 마커로 그린다(web/app/page.tsx의 agent_phase 핸들러).
+        phase_id = event.get("phase", "")
+        # project_messages와 동일하게 서버에도 최신 상태를 남겨둔다 — 그래야
+        # 이 이벤트가 지나간 뒤에 새로 연결된 탭도 _make_project_info를 통해
+        # 지금까지의 칩을 그대로 복원할 수 있다(위 project_phases 주석 참고).
+        project_phases.setdefault(project_id, {}).setdefault(agent_name, {})[phase_id] = {
+            "label": event.get("label", ""), "status": event.get("status", ""),
+            "detail": event.get("detail", ""), "ts": int(time.time() * 1000),
+        }
+        await broadcast({
+            "type": "agent_phase",
+            "project_id": project_id,
+            "agent": agent_name,
+            "stage": event.get("stage", ""),
+            "phase": phase_id,
+            "label": event.get("label", ""),
+            "status": event.get("status", ""),
+            "detail": event.get("detail", ""),
         })
 
 
@@ -1178,6 +1221,7 @@ async def _retry_implement_with_feedback(pipeline: Pipeline, feedback: str, scen
         )
 
     pipeline.mark_running("implement")
+    _clear_phases(pid, ["implement"])
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "implement", "status": "running"})
     await _send_task_or_manual(pipeline, "implement", None, "implement", {
         "project_id": pid,
@@ -1259,6 +1303,7 @@ async def _retry_qa_with_feedback(pipeline: Pipeline, feedback: str):
         instruction += f"\n\n[QA 재실행 요청] {feedback}"
 
     pipeline.mark_running("qa")
+    _clear_phases(pid, ["qa"])
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "qa", "status": "running"})
     await _send_task_or_manual(pipeline, "qa", None, "qa", {
         "project_id": pid, "stage": "qa", "instruction": instruction,
@@ -1281,6 +1326,7 @@ async def _retry_autotest_with_feedback(pipeline: Pipeline, feedback: str):
         instruction += f"\n\n[AutoTest 재실행 요청] {feedback}"
 
     pipeline.mark_running("autotest")
+    _clear_phases(pid, ["autotest"])
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "autotest", "status": "running"})
     await _send_task_or_manual(pipeline, "autotest", None, "autotest", {
         "project_id": pid, "stage": "autotest", "instruction": instruction,
@@ -1303,6 +1349,7 @@ async def _retry_release_with_feedback(pipeline: Pipeline, feedback: str):
         instruction += f"\n\n[Release 재실행 요청] {feedback}"
 
     pipeline.mark_running("release")
+    _clear_phases(pid, ["release"])
     await broadcast({"type": "stage_update", "project_id": pid, "stage": "release", "status": "running"})
     await _send_task_or_manual(pipeline, "release", pid, "release", {
         "project_id": pid, "stage": "release", "instruction": instruction,
@@ -1430,6 +1477,7 @@ async def advance_pipeline(pipeline: Pipeline):
             context["scenarios"] = scenarios
 
         pipeline.mark_running(stage.name)
+        _clear_phases(pipeline.project_id, stage.agents)
         await broadcast({"type": "stage_update", "project_id": pipeline.project_id, "stage": stage.name, "status": "running"})
         await _jira_stage_started(pipeline.project_id, stage.name)
 
@@ -1470,6 +1518,7 @@ def _make_project_info(pid: str) -> dict:
         "name":     project_names.get(pid, pid),
         "repo":     project_repos.get(pid, ""),
         "messages": project_messages.get(pid, []),
+        "phases":   project_phases.get(pid, {}),
         "jira":     project_jira.get(pid, {}),
         "token_totals": {
             "lifetime": _derive_lifetime_totals(pid),
@@ -2235,12 +2284,20 @@ async def trigger_deploy(project_id: str):
     if not workspace:
         raise HTTPException(400, "host_workspace_path가 설정돼 있지 않습니다 — 배포 카드에서 먼저 설정하세요")
 
-    project_deploy_status[project_id] = {"status": "running", "started_at": int(time.time() * 1000)}
+    project_deploy_status[project_id] = {"status": "running", "started_at": int(time.time() * 1000), "phases": {}}
     _save_project(project_id)
     await broadcast({
         "type": "project_updated", "project_id": project_id,
         "projects": {project_id: _make_project_info(project_id)},
     })
+
+    # host_workspace_path가 아직 clone된 적 없는 빈 디렉토리일 수 있으므로,
+    # deploy_runner가 필요하면 스스로 clone할 수 있게 이 프로젝트의 GitHub 레포
+    # URL을 같이 넘긴다 — clone_existing_repo(프로젝트 생성 시 clone)와 동일하게
+    # GITHUB_TOKEN을 박아 만든다. 연결된 레포가 없거나 토큰이 없으면 None으로
+    # 넘어가고, deploy_runner는 workspace가 이미 clone돼 있지 않으면 그때 에러를 낸다.
+    github_repo = project_repos.get(project_id)
+    repo_url = f"https://{GITHUB_TOKEN}@github.com/{github_repo}.git" if (github_repo and GITHUB_TOKEN) else None
 
     payload = {
         "project_id": project_id,
@@ -2248,7 +2305,9 @@ async def trigger_deploy(project_id: str):
         "environment": cfg.get("environment", "prod"),
         "platforms": cfg.get("platforms", ["ios", "android"]),
         "app_version": cfg.get("app_version"),
+        "repo_url": repo_url,
         "callback_url": "http://localhost:8000/internal/deploy-callback",
+        "progress_url": "http://localhost:8000/internal/deploy-progress",
     }
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -2299,6 +2358,7 @@ async def deploy_callback(body: DeployCallback):
         "build_number": body.build_number,
         "log_tail": body.log_tail,
         "error": body.error,
+        "phases": prev.get("phases", {}),  # 단계별 스텝칩은 이 결과가 온 뒤에도 그대로 남겨서 보여준다
     }
     _save_project(project_id)
     await broadcast({
@@ -2307,6 +2367,32 @@ async def deploy_callback(body: DeployCallback):
     })
     label = f"{body.app_version}+{body.build_number}" if body.success else (body.error or "실패")
     await _add_history(project_id, f"{'✅' if body.success else '❌'} 배포 {'완료' if body.success else '실패'}: {label}")
+    return {"ok": True}
+
+
+class DeployProgress(BaseModel):
+    project_id: str
+    phase: str
+    status: str   # start|success|fail
+    label: str
+    detail: str = ""
+
+@app.post("/internal/deploy-progress")
+async def deploy_progress(body: DeployProgress):
+    """deploy_runner.py가 배포 단계(workspace/version/build/fastlane/commit_push)
+    하나를 시작·완료할 때마다 보내는 진행 상황 통보 — 배포 카드의 스텝칩을
+    채운다. deploy-callback과 동일하게 내부 전용, 무인증."""
+    project_id = body.project_id
+    if project_id not in projects:
+        raise HTTPException(404)
+
+    st = project_deploy_status.setdefault(project_id, {"status": "running"})
+    phases = st.setdefault("phases", {})
+    phases[body.phase] = {"status": body.status, "label": body.label, "detail": body.detail}
+    await broadcast({
+        "type": "project_updated", "project_id": project_id,
+        "projects": {project_id: _make_project_info(project_id)},
+    })
     return {"ok": True}
 
 
