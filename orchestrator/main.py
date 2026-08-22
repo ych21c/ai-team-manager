@@ -916,6 +916,13 @@ async def _create_ad_hoc_jira_story(project_id: str, title: str) -> str | None:
         "type": "agent_message", "project_id": project_id, "agent": "system",
         "content": f"📋 [Sprint {sprint}] 새 Jira 이슈 생성: {_story_link(project_id, key, 'spec')}",
     })
+    if records[0].get("parent_linked") is False:
+        await broadcast({
+            "type": "agent_message", "project_id": project_id, "agent": "system",
+            "content": (f"⚠️ {key}는 만들어졌지만 Epic({epic})에 연결하지 못했습니다 — "
+                        f"{epic}의 Jira 이슈 타입이 실제 Epic이 아닌 것으로 보입니다. Jira에서 "
+                        f"{epic}의 이슈 타입을 Epic으로 바꾸거나, {key}를 수동으로 연결해주세요."),
+        })
     return key
 
 
@@ -954,11 +961,22 @@ async def _sync_new_requirements_to_epic(project_id: str, pm_text: str) -> list[
         return []
 
     jira["synced_req_ids"] = list(synced_ids)
+    unlinked_keys = []
     for r in records:
         jira.setdefault("stories", []).append(r["key"])
         jira.setdefault("story_titles", {})[r["key"]] = r["title"]
         if r.get("subtasks"):
             jira.setdefault("story_subtasks", {})[r["key"]] = r["subtasks"]
+        if r.get("parent_linked") is False:
+            unlinked_keys.append(r["key"])
+
+    if unlinked_keys:
+        await broadcast({
+            "type": "agent_message", "project_id": project_id, "agent": "system",
+            "content": (f"⚠️ {', '.join(unlinked_keys)}는 만들어졌지만 Epic({epic})에 연결하지 "
+                        f"못했습니다 — {epic}의 Jira 이슈 타입이 실제 Epic이 아닌 것으로 보입니다. "
+                        f"Jira에서 {epic}의 이슈 타입을 Epic으로 바꾸거나 수동으로 연결해주세요."),
+        })
 
     return records
 
